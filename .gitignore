@@ -1,0 +1,25 @@
+# --- zig toolchain & build cache (large, download separately) ---
+/toolchain/
+/.zigcache/
+/zig-cache/
+/zig-out/
+
+# --- build output (dist/ holds the committed prebuilt binary) ---
+/*.exe
+/*.pdb
+/*.obj
+/*.res
+*.o
+
+# --- local debugging artifacts ---
+*.log
+/*_dbg.exe
+/*_sim.exe
+
+# --- OS / editor ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp

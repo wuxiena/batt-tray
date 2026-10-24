@@ -1,0 +1,19 @@
+# normalize line endings
+* text=auto
+
+# source: keep LF
+*.c      text eol=lf
+*.h      text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.gitignore text eol=lf
+LICENSE  text eol=lf
+
+# windows scripts: CRLF
+*.cmd    text eol=crlf
+*.bat    text eol=crlf
+
+# binaries
+*.exe    binary
+*.png    binary
+*.ico    binary
