@@ -1524,7 +1524,9 @@ static BOOL match_group(COLL *col, int *idx, int gn, BYTE mask, DEVENT *d)
             d->featLen = c->featLen;
             if (answered)
                 d->lastLevel = r.level;
-            logf(L"match VEND90 answered=%d level=%d", answered, r.level);
+            else
+                d->lastLevel = -1;   /* 不然 ZeroMemory 留下的 0 会被当成「电量 0%」 */
+            logf(L"match VEND90 answered=%d level=%d", answered, d->lastLevel);
             return TRUE;
         }
     }
