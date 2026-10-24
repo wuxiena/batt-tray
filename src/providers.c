@@ -720,7 +720,11 @@ static BOOL razer_query(HANDLE h, int featLen, READING *r)
     if (!HidD_SetFeature(h, tx, (ULONG)n))
         io_write(h, tx, (DWORD)n, 300);
 
-    for (int tries = 0; tries < 8; tries++) {
+    /* 注意：HidD_SetFeature / HidD_GetFeature 是同步阻塞 API（无超时参数）。
+       雷蛇电量走 feature 报告协议，必须用它；一旦设备关机但接收器还在、
+       或设备不响应，单次调用可能卡住数秒。这里把重试压到 3 次，避免把
+       单线程消息循环（整个 UI）拖到几十秒无响应。 */
+    for (int tries = 0; tries < 3; tries++) {
         Sleep(25);
         ZeroMemory(rx, sizeof(rx));
         if (!HidD_GetFeature(h, rx, (ULONG)n)) {
