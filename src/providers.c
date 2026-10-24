@@ -62,6 +62,7 @@ enum {
     K_XINPUT,       /* Xbox / XInput 兼容手柄 */
     K_WINBAT,       /* Windows 电池类设备 */
     K_VEND90,       /* 0xFF90 厂商通道（耳机 dongle，MCHOSE V9 Pro 同族） */
+    K_GAMESIR,      /* 小鸡 GameSir 0x3537 厂商接口（0x12 报文） */
     K_FAKE          /* 仅 -DBATT_FAKE 调试构建使用，正式版不会出现 */
 };
 
@@ -96,6 +97,9 @@ static int    g_ndev;
 
 /* 0xFF90 通道连续不应答计数：不应答的 dongle 不该每轮都去敲一次 */
 static int    g_v90fail[PROV_MAX];
+
+/* 小鸡手柄心跳后仍读不到 0x12 报文的计数（同上，退避用） */
+static int    g_gsrFail[PROV_MAX];
 
 /* 诊断日志（跨设备共用一份，按扫描顺序追加） */
 static WCHAR g_log[16384];
@@ -207,6 +211,8 @@ static const BRAND kBrands[] = {
     { 0x057E, L"任天堂 Nintendo" },
     { 0x2DC8, L"八位堂 8BitDo" },
     { 0x2563, L"北通 BETOP" },
+    { 0x2F24, L"小鸡 GameSir" },      /* 小鸡的 XInput / GIP 身份（USB-IF 登记在深圳汇佳智） */
+    { 0x3537, L"小鸡 GameSir" },      /* 小鸡的厂商接口身份，电量走这里 */
     { 0x28DE, L"Valve" },
     { 0x0F0D, L"鸿绪 HORI" },
     { 0x1395, L"森海塞尔 Sennheiser" },
@@ -223,6 +229,8 @@ static const BRAND kBrands[] = {
 typedef struct { const WCHAR *key; const WCHAR *name; } PRODBRAND;
 
 static const PRODBRAND kProdBrands[] = {
+    { L"GAMESIR",       L"小鸡 GameSir" },
+    { L"CYCLONE",       L"小鸡 GameSir" },
     { L"XIBERIA",       L"西伯利亚 XIBERIA" },
     { L"EDIFIER",       L"漫步者 Edifier" },
     { L"MCHOSE",        L"迈从 MCHOSE" },
@@ -926,6 +934,50 @@ static BOOL vend90_query_co(HANDLE h, int outLen, int inLen, READING *r)
     return FALSE;
 }
 
+/* ---------------- 协议族：小鸡 GameSir（0x3537 厂商接口） ---------------- */
+//
+// 小鸡手柄在 PC 上有两套身份：
+//     0x2F24 —— XInput / GIP 身份，Windows 里就是一支普通 Xbox 手柄；
+//     0x3537 —— 厂商接口，电量只走这里。
+// 厂商接口的读法来自开源逆向项目 broroeror/gamesir-linux-tools（Cyclone 2 /
+// G7 Pro / G7 SE / Tarantula 实测）：先发一条 0x0F 报文做心跳，手柄才会持续
+// 推送 0x12 状态报文；报文第 36 字节就是电量百分比，第 35 字节 bit0 是充电。
+// 心跳不发，通道完全是哑的——这一点和「先听再说」的耳机 dongle 不同。
+//
+// ⚠️ 本分支尚未在实机上验证（写这段时手上没有小鸡手柄）。解析只认 0x12 报文
+// 头且电量限定 0..100，认不出来就当作「不可读」，不会编数字。
+
+static BOOL gamesir_read_co(HANDLE h, int outLen, int inLen, READING *r)
+{
+    BYTE tx[64];
+    int  n = (outLen >= 4 && outLen <= (int)sizeof(tx)) ? outLen : 64;
+
+    ZeroMemory(tx, sizeof(tx));
+    tx[0] = 0x0F;                 /* 输出报文 id */
+    tx[1] = 0xF2;                 /* 心跳 */
+    if (!io_write(h, tx, (DWORD)n, 200))
+        return FALSE;
+
+    int rd = (inLen >= 37 && inLen <= (int)sizeof(tx)) ? inLen : 64;
+    for (int tries = 0; tries < 3; tries++) {
+        BYTE  rx[64];
+        DWORD got = 0;
+        ZeroMemory(rx, sizeof(rx));
+        if (!io_read(h, rx, (DWORD)rd, &got, 90))
+            return FALSE;         /* 超时：报文没来（手柄没连 / 不在 Xbox 模式） */
+        if (got < 37 || rx[0] != 0x12)
+            continue;             /* 别的报文，继续等 */
+        int lv = rx[36];
+        if (lv < 0 || lv > 100)
+            continue;
+        r->level = lv;
+        r->charging = (rx[35] & 0x01) ? 1 : 0;
+        r->valid = TRUE;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 /* ---------------- 协议族：索尼手柄（DualShock 4 / DualSense） ---------------- */
 //
 // 手柄按固定频率推送输入报文，因此走被动路径：读完再挂起下一次读。
@@ -1383,6 +1435,58 @@ static BOOL match_group(COLL *col, int *idx, int gn, BYTE mask, DEVENT *d)
         CloseHandle(h);
     }
 
+    /* 8.2) 小鸡 GameSir：0x3537 厂商接口。手柄在 Xbox 模式下才推 0x12 报文，
+       没连手柄的 dongle 也会枚举但不说话——两种情况都登记，菜单里能看出区别。 */
+    {
+        int cand = -1;
+        for (int k = 0; k < gn; k++) {
+            const COLL *c = &col[idx[k]];
+            if (c->vid != 0x3537 || !is_vendor_page(c->usagePage))
+                continue;
+            if (c->inLen < 37 || c->outLen < 4)
+                continue;
+            if (cand < 0)
+                cand = k;
+
+            HANDLE h = dev_open_ex(c->path, FALSE);
+            if (h == INVALID_HANDLE_VALUE)
+                continue;
+            READING r;
+            ZeroMemory(&r, sizeof(r));
+            if (gamesir_read_co(h, c->outLen, c->inLen, &r) && r.valid) {
+                WCHAR det[144];
+                const WCHAR *tp = (lstrcmpW(type, L"设备") == 0) ? L"手柄" : type;
+                wsprintfW(det, L"GameSir · 0x12 状态报文 · %u 字节", c->inLen);
+                fill_common(d, c, K_GAMESIR, brand_name(c->vid, c->pid), tp, det);
+                d->h = h;
+                d->outLen = c->outLen;
+                d->inLen = c->inLen;
+                d->featLen = c->featLen;
+                d->lastLevel = r.level;
+                logf(L"match GAMESIR level=%d charging=%d", r.level, r.charging);
+                return TRUE;
+            }
+            CloseHandle(h);
+        }
+        if (cand >= 0) {
+            const COLL *c = &col[idx[cand]];
+            HANDLE h = dev_open_ex(c->path, FALSE);
+            if (h != INVALID_HANDLE_VALUE) {
+                WCHAR det[144];
+                const WCHAR *tp = (lstrcmpW(type, L"设备") == 0) ? L"手柄" : type;
+                wsprintfW(det, L"GameSir · 0x12 状态报文 · %u 字节 · 无应答", c->inLen);
+                fill_common(d, c, K_GAMESIR, brand_name(c->vid, c->pid), tp, det);
+                d->h = h;
+                d->outLen = c->outLen;
+                d->inLen = c->inLen;
+                d->featLen = c->featLen;
+                d->lastLevel = -1;
+                logf(L"match GAMESIR 无应答");
+                return TRUE;
+            }
+        }
+    }
+
     /* 8.5) 0xFF90 厂商通道：耳机 dongle。
        必须要求整组里出现音频类集合（TM_AUDIO），否则会和鼠标的其它
        厂商页面混淆。这里不做「必须先应答」的门槛——耳机可能正处于
@@ -1617,6 +1721,7 @@ int prov_scan(void)
     g_logLen = 0;
     g_log[0] = 0;
     ZeroMemory(g_v90fail, sizeof(g_v90fail));
+    ZeroMemory(g_gsrFail, sizeof(g_gsrFail));
 
     COLL col[MAX_COLL];
     int n = coll_enum(col, MAX_COLL);
@@ -1668,7 +1773,18 @@ int prov_scan(void)
 
     /* XInput 手柄（Xbox / 北通 / 飞智等 XInput 模式） */
     BOOL xiGood = FALSE;
-    if (xi_init()) {
+
+    /* 小鸡手柄同时暴露两个身份：0x2F24 的 XInput 和 0x3537 的厂商接口，
+       电量只有后者有。已经认出小鸡，就不再重复列一台「读不到电量」的手柄。 */
+    BOOL haveGsr = FALSE;
+    for (int i = 0; i < g_ndev; i++) {
+        if (g_dev[i].kind == K_GAMESIR) {
+            haveGsr = TRUE;
+            break;
+        }
+    }
+
+    if (!haveGsr && xi_init()) {
         for (DWORD i = 0; i < 4 && g_ndev < PROV_MAX; i++) {
             READING r;
             ZeroMemory(&r, sizeof(r));
@@ -1907,6 +2023,23 @@ BOOL prov_poll(int i, READING *r)
             }
         } else {
             g_v90fail[i]++;
+        }
+        break;
+    case K_GAMESIR:
+        /* 读不到 0x12 报文时降频：这类设备不该每轮都白等三次读超时。 */
+        if (g_gsrFail[i] >= 3 && (g_gsrFail[i] % 9) != 0) {
+            g_gsrFail[i]++;
+            break;
+        }
+        ok = d->h ? gamesir_read_co(d->h, d->outLen, d->inLen, r) : FALSE;
+        if (ok && r->valid) {
+            g_gsrFail[i] = 0;
+            if (w_contains(d->detail, L"无应答")) {
+                wsprintfW(d->detail, L"GameSir · 0x12 状态报文 · %d 字节", d->inLen);
+                logf(L"GAMESIR starts answering, level=%d", r->level);
+            }
+        } else {
+            g_gsrFail[i]++;
         }
         break;
     case K_FAKE:
