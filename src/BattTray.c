@@ -1,4 +1,4 @@
-// RapooBattery - 无线鼠标电量托盘工具（多品牌）
+// BattTray - 无线鼠标电量托盘工具（多品牌）
 // 依赖：纯 Win32 API，无运行时框架
 // 结构：providers.c 负责各品牌协议；本文件负责界面与消息循环
 // 界面：托盘电池图标 + 圆形浮窗（环形进度 + 中心百分比）
@@ -28,17 +28,18 @@
    托盘实际只显示 16px，画电池外形再塞数字必然糊成一团，
    所以这里直接让「数字」当主角，用 3x5 点阵放大绘制，笔画干净。 */
 #define ICON_MAX         32     /* 支持的最大图标边长（高 DPI） */
+#define ICON_SS          4      /* 图标圆角覆盖率子采样倍数 */
 #define DIG_W            3      /* 点阵字宽（像素） */
 #define DIG_H            5      /* 点阵字高（像素） */
 
 #define FLOAT_DIA        62     /* 圆形浮窗逻辑直径 */
 #define SS               4      /* 超采样倍数（抗锯齿） */
 
-static const WCHAR kClass[] = L"RapooBatteryWnd";
-static const WCHAR kRegKey[] = L"Software\\RapooBattery";
+static const WCHAR kClass[] = L"BattTrayWnd";
+static const WCHAR kRegKey[] = L"Software\\BattTray";
 static const WCHAR kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static const WCHAR kRunVal[] = L"RapooBattery";
-static const WCHAR kMutex[] = L"Local\\RapooBattery_SingleInstance";
+static const WCHAR kRunVal[] = L"BattTray";
+static const WCHAR kMutex[] = L"Local\\BattTray_SingleInstance";
 
 static HINSTANCE g_inst;
 static HWND      g_hwnd;
@@ -157,12 +158,21 @@ static void put_px(DWORD *px, int s, int x, int y, DWORD c)
 static DWORD level_color(int level)
 {
     if (level < 0)
-        return 0xFF8C8C8C;
+        return 0xFF9AA3AD;   /* 未知：中性灰蓝 */
     if (level <= 20)
-        return 0xFFEB3B3B;
+        return 0xFFFF5A5A;   /* 低电量：亮红，暗色任务栏上也跳得出来 */
     if (level <= 50)
-        return 0xFFF5A51E;
-    return 0xFF3CC83C;
+        return 0xFFFFB020;   /* 中等：琥珀 */
+    return 0xFF3FD964;       /* 充足：绿 */
+}
+
+/* 线性混色，t 为 b 的权重（0..256） */
+static DWORD rgb_mix(DWORD a, DWORD b, int t)
+{
+    int r = (((int)(a >> 16) & 0xFF) * (256 - t) + ((int)(b >> 16) & 0xFF) * t) >> 8;
+    int g = (((int)(a >> 8) & 0xFF) * (256 - t) + ((int)(b >> 8) & 0xFF) * t) >> 8;
+    int bl = ((int)(a & 0xFF) * (256 - t) + (int)(b & 0xFF) * t) >> 8;
+    return 0xFF000000u | ((DWORD)r << 16) | ((DWORD)g << 8) | (DWORD)bl;
 }
 
 static DWORD shade(DWORD c, int pct)
@@ -183,24 +193,36 @@ static int icon_size(void)
     return s;
 }
 
-/* 圆角矩形的裁剪判断，四角按 1/4 圆处理 */
-static BOOL in_round(int x, int y, int s, int r)
+/* 圆角矩形覆盖率：每像素 4x4 子采样，返回 0..16。
+   直接算覆盖率而不是逐像素硬切，圆角才有抗锯齿的过渡。 */
+static int rr_cov(int s, int rad, int x, int y)
 {
-    int cx, cy;
-    if (x < r && y < r)                { cx = r;         cy = r;         }
-    else if (x >= s - r && y < r)      { cx = s - r - 1; cy = r;         }
-    else if (x < r && y >= s - r)      { cx = r;         cy = s - r - 1; }
-    else if (x >= s - r && y >= s - r) { cx = s - r - 1; cy = s - r - 1; }
-    else return TRUE;
+    double half = s * 0.5;
+    double lim  = half - rad;
+    int n = 0;
 
-    int dx = x - cx, dy = y - cy;
-    return (dx * dx + dy * dy) <= r * r;
+    for (int sy = 0; sy < ICON_SS; sy++) {
+        double py = y + (sy + 0.5) / ICON_SS;
+        double dy = fabs(py - half) - lim;
+        if (dy < 0)
+            dy = 0;
+        for (int sx = 0; sx < ICON_SS; sx++) {
+            double px = x + (sx + 0.5) / ICON_SS;
+            double dx = fabs(px - half) - lim;
+            if (dx < 0)
+                dx = 0;
+            if (dx * dx + dy * dy <= (double)rad * rad)
+                n++;
+        }
+    }
+    return n;
 }
 
 static void draw_digits(DWORD *px, int s, const WCHAR *t, int n, int k, DWORD color)
 {
     int gw  = DIG_W * k;
-    int w   = n * gw + (n - 1);          /* 字间留 1 像素 */
+    int gap = k;                         /* 字距跟着缩放走，整体宽度才是偶数格，能居中 */
+    int w   = n * gw + (n - 1) * gap;
     int h   = DIG_H * k;
     int x0  = (s - w) / 2;
     int y0  = (s - h) / 2;
@@ -210,7 +232,7 @@ static void draw_digits(DWORD *px, int s, const WCHAR *t, int n, int k, DWORD co
         if (t[i] >= L'0' && t[i] <= L'9')
             gi = (int)(t[i] - L'0');
         const BYTE *g = kGlyph[gi];
-        int bx = x0 + i * (gw + 1);
+        int bx = x0 + i * (gw + gap);
 
         for (int row = 0; row < DIG_H; row++) {
             for (int col = 0; col < DIG_W; col++) {
@@ -246,22 +268,43 @@ static HICON build_icon(int level, BOOL dim)
     ZeroMemory(px, (SIZE_T)S * S * 4);
 
     DWORD fg = level_color(level);
-    if (dim)
-        fg = shade(fg, 55);
-    DWORD bg = dim ? 0xFF343434u : 0xFF1C1C1Cu;
+    if (dim) {
+        /* 缓存读数：只压掉一部分鲜艳度，仍看得出电量档位 */
+        fg = rgb_mix(fg, 0xFF8A8A8A, 96);
+    }
 
-    /* 深色徽章底：亮色数字在浅色/深色任务栏上都能读 */
-    int r = (S >= 28) ? 4 : (S >= 20 ? 3 : 2);
-    for (int y = 0; y < S; y++)
-        for (int x = 0; x < S; x++)
-            if (in_round(x, y, S, r))
-                put_px(px, S, x, y, bg);
+    /* 深色徽章底：亮色数字在浅色/深色任务栏上都能读。
+       上下做一道很轻的渐变（上浅下深），16px 下才不像一块死黑方块。 */
+    DWORD top = dim ? 0xFF454545u : 0xFF3F4855u;
+    DWORD bot = dim ? 0xFF232323u : 0xFF14171Bu;
+    DWORD hi  = dim ? 0xFF555555u : 0xFF4C5766u;   /* 顶部高光 */
 
-    /* 文本：两位数字为主，满电三位，未知显示 "--" */
+    int rad   = (S >= 28) ? 6 : (S >= 20 ? 5 : 4);
+    int span  = (S > 1) ? S - 1 : 1;
+    int denom = ICON_SS * ICON_SS;
+
+    for (int y = 0; y < S; y++) {
+        DWORD base = rgb_mix(top, bot, y * 256 / span);
+        /* 最上面一行再提一点，给平铺的方块一点体积感 */
+        if (y == 0)
+            base = rgb_mix(base, hi, 56);
+        else if (y == 1)
+            base = rgb_mix(base, hi, 18);
+
+        for (int x = 0; x < S; x++) {
+            int cov = rr_cov(S, rad, x, y);
+            if (cov <= 0)
+                continue;
+            DWORD a = (DWORD)(cov * 255 / denom);
+            px[y * S + x] = (a << 24) | (base & 0x00FFFFFFu);
+        }
+    }
+
+    /* 文本：两位数字为主，满电三位，未知显示一根横杠 */
     WCHAR t[4];
     int n;
     if (level < 0) {
-        t[0] = L'-'; t[1] = L'-'; n = 2;
+        t[0] = L'-'; n = 1;
     } else {
         int lv = clamp100(level);
         if (lv >= 100) {
@@ -280,7 +323,7 @@ static HICON build_icon(int level, BOOL dim)
     int avail  = S - 2 * margin;
     int k = 1;
     for (int kk = 8; kk >= 2; kk--) {
-        int w = n * DIG_W * kk + (n - 1);
+        int w = n * DIG_W * kk + (n - 1) * kk;
         int h = DIG_H * kk;
         if (w <= avail && h <= avail) {
             k = kk;
@@ -604,7 +647,7 @@ static void export_diag(void)
         slash[1] = 0;
     else
         path[0] = 0;
-    lstrcatW(path, L"RapooBattery-diag.txt");
+    lstrcatW(path, L"BattTray-diag.txt");
 
     /* 托盘气泡提示，不弹模态对话框 */
     NOTIFYICONDATAW nid;
@@ -810,7 +853,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     switch (msg) {
-#ifdef RB_SIM
+#ifdef BATT_SIM
     case WM_TIMER:
         if (wp == 9) {
             READING r;
@@ -922,7 +965,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpszClassName = kClass;
     RegisterClassExW(&wc);
 
-    g_hwnd = CreateWindowExW(0, kClass, L"RapooBattery", WS_OVERLAPPED,
+    g_hwnd = CreateWindowExW(0, kClass, L"BattTray", WS_OVERLAPPED,
                              0, 0, 0, 0, NULL, NULL, inst, NULL);
     if (!g_hwnd)
         return 1;
@@ -940,7 +983,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     }
 
     g_float = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                              kClass, L"RapooBatteryFloat", WS_POPUP,
+                              kClass, L"BattTrayFloat", WS_POPUP,
                               0, 0, g_dia, g_dia, NULL, NULL, inst, NULL);
 
     g_font = CreateFontW(-(int)(scale(23) * SS), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
@@ -958,7 +1001,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     prov_scan();
     after_scan();
 
-#ifdef RB_SIM
+#ifdef BATT_SIM
     SetTimer(g_hwnd, 9, 1500, NULL);
 #endif
 

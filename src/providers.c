@@ -1158,13 +1158,13 @@ BOOL prov_diag(const WCHAR *path)
 
     int len = 0;
     len += wsprintfW(txt + len,
-                     L"RapooBattery diagnostics\r\n"
+                     L"BattTray diagnostics\r\n"
                      L"version : %s\r\n"
                      L"provider: %s\r\n"
                      L"protocol: %s\r\n"
                      L"reading : %d\r\n"
                      L"reports : in=%d out=%d feature=%d\r\n\r\n",
-                     RB_VERSION,
+                     BATT_VERSION,
                      g_name[0] ? g_name : L"(none)",
                      g_detail[0] ? g_detail : L"(unknown)",
                      g_lastLevel, g_inLen, g_outLen, g_featLen);

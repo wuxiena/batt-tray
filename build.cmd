@@ -1,5 +1,5 @@
 @echo off
-rem Build dist\RapooBattery.exe with zig (MinGW-w64 target). No Visual Studio required.
+rem Build dist\BattTray.exe with zig (MinGW-w64 target). No Visual Studio required.
 rem Usage: build.cmd
 rem
 rem zig is resolved in this order:
@@ -25,7 +25,7 @@ set "ZIG_LOCAL_CACHE_DIR=%~dp0.zigcache"
 if not exist "dist" mkdir "dist"
 
 "%ZIG%" cc -target x86_64-windows-gnu -O2 -s -Wl,--subsystem,windows ^
-    -o dist\RapooBattery.exe src\RapooBattery.c src\providers.c ^
+    -o dist\BattTray.exe src\BattTray.c src\providers.c ^
     -luser32 -lshell32 -lgdi32 -ladvapi32 -lhid -lsetupapi -lm
 if errorlevel 1 (
     echo BUILD FAILED
@@ -33,4 +33,4 @@ if errorlevel 1 (
 )
 
 echo BUILD OK
-for %%f in (dist\RapooBattery.exe) do echo   %%~ff  %%~zf bytes
+for %%f in (dist\BattTray.exe) do echo   %%~ff  %%~zf bytes

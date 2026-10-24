@@ -1,4 +1,4 @@
-"""List top-level windows belonging to RapooBattery and dump their rects/state."""
+"""List top-level windows belonging to BattTray and dump their rects/state."""
 import ctypes
 from ctypes import wintypes as w
 
@@ -30,7 +30,7 @@ def main():
     def cb(h, lparam):
         cls = get_text(h, user32.GetClassNameW)
         title = get_text(h, user32.GetWindowTextW)
-        if cls == "RapooBatteryWnd":
+        if cls == "BattTrayWnd":
             r = RECT()
             user32.GetWindowRect(h, ctypes.byref(r))
             results.append((h, title, cls, user32.IsWindowVisible(h), bool(user32.IsWindowEnabled(h)),
@@ -41,7 +41,7 @@ def main():
     for h, title, cls, vis, en, rect, pid in results:
         print(f"hwnd=0x{h:X} pid={pid} title={title!r} visible={bool(vis)} enabled={en} rect={rect}")
     if not results:
-        print("no RapooBatteryWnd windows found")
+        print("no BattTrayWnd windows found")
 
 
 if __name__ == "__main__":

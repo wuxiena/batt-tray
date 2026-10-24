@@ -1,4 +1,4 @@
-"""Generate app.ico (16/32/48 px) for RapooBattery - pure stdlib, no PIL."""
+"""Generate app.ico (16/32/48 px) for BattTray - pure stdlib, no PIL."""
 import struct, os
 
 GREEN = (0x3C, 0xC8, 0x3C)  # R,G,B

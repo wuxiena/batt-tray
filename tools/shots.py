@@ -1,11 +1,15 @@
-"""Capture the docs screenshots: tray icon strip + circular float window.
+"""Regenerate the docs screenshots.
 
-The taskbar is usually covered by whatever window is in the foreground, so we
-briefly show the desktop (Win+D), grab the notification area, then restore.
+- docs/tray-icon.png : rendered by the app's own drawing code (tools/icontest.exe),
+  three rows = light taskbar / dark taskbar / cached reading
+- docs/preview.png   : live capture of the circular float window
+
+The taskbar is usually covered by whatever window is in the foreground, so the
+tray strip grab briefly shows the desktop (Win+D), then restores it.
 
 usage: python shots.py [scale]
 """
-import ctypes, os, sys, time
+import ctypes, os, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture import grab, write_png
@@ -137,12 +141,23 @@ def find_badge(raw, w, h, bpp):
     return best
 
 
+def render_icon_sheet(k):
+    """Ask icontest.exe for the icon states, then convert to a scaled PNG."""
+    exe = os.path.join("tools", "icontest.exe")
+    if not os.path.exists(exe):
+        print("skip docs/tray-icon.png: tools/icontest.exe not built")
+        return
+    subprocess.run([os.path.abspath(exe)], cwd="shots", check=True)
+    subprocess.run([sys.executable, "tools/bmp2png.py",
+                    "shots/preview.bmp", "docs/tray-icon.png", str(k)], check=True)
+
+
 def main():
     k = int(sys.argv[1]) if len(sys.argv) > 1 else 8
     os.makedirs("shots", exist_ok=True)
     os.makedirs("docs", exist_ok=True)
 
-    # 1) 托盘：任务栏常被前台窗口遮住，先显示桌面
+    # 1) 托盘实拍：任务栏常被前台窗口遮住，先显示桌面
     show_desktop()
     time.sleep(1.8)
     raw, w, h = grab(1480, 1032, 200, 44)
@@ -159,17 +174,14 @@ def main():
         pad = (44 - 26) // 2
         sub = crop(raw, w, h, bpp, x0, pad, cw, 26)
         write_png("shots/tray_icon_raw.png", sub, cw, 26)
-    else:
-        print("badge not found, using fixed crop")
-        sub = crop(raw, w, h, bpp, 56, 9, 30, 26)
-        write_png("shots/tray_icon_raw.png", sub, 30, 26)
 
     show_desktop()
     time.sleep(0.6)
-    tw, th = upscale("shots/tray_icon_raw.png", "docs/tray-icon.png", k)
-    print("docs/tray-icon.png %dx%d" % (tw, th))
 
-    # 2) 圆形浮窗：本身置顶，无需切桌面
+    # 2) 图标各状态：由程序自身绘制代码渲染（见 tools/icontest.c）
+    render_icon_sheet(k)
+
+    # 3) 圆形浮窗：本身置顶，无需切桌面
     raw, w, h = grab(1826, 906, 66, 66)
     write_png("shots/float_raw.png", raw, w, h)
     fw, fh = upscale("shots/float_raw.png", "docs/preview.png", 5)

@@ -4,8 +4,8 @@
 
 #include <windows.h>
 
-#ifndef RB_VERSION
-#define RB_VERSION L"1.1.0"
+#ifndef BATT_VERSION
+#define BATT_VERSION L"1.2.0"
 #endif
 
 typedef struct {
