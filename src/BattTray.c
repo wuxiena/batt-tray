@@ -32,6 +32,7 @@
 #define MENU_STATS      10       /* 使用统计子菜单 */
 #define MENU_HIST_CLEAR 11       /* 清除历史连接记录 */
 #define MENU_RESET      12       /* 重置所有信息 */
+#define MENU_UNINSTALL  13       /* 卸载并清除所有数据 */
 #define MENU_HIST_BASE  300      /* 统计条目（灰色，仅展示）：300 .. 300+HIST_MAX-1 */
 
 /* 离线判定。无线设备关机后接收器还在枚举，所以只能靠「还有没有回应」判断：
@@ -132,6 +133,7 @@ static int        g_dia = FLOAT_DIA;
 #define STAMP_UNIT 600000000ULL
 
 static void reset_all(void);   /* 前置声明：定义在缓存恢复一节 */
+static void uninstall(void);   /* 前置声明：定义在缓存恢复一节 */
 
 static DWORD stamp_now(void)
 {
@@ -1145,6 +1147,8 @@ static void show_menu(int i)
     AppendMenuW(m, MF_STRING, MENU_RESCAN, L"重新扫描设备");
     AppendMenuW(m, MF_STRING, MENU_RESET, L"重置所有信息");
     AppendMenuW(m, MF_STRING, MENU_DIAG, L"导出诊断信息…");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, MENU_UNINSTALL, L"卸载并清除所有数据…");
     AppendMenuW(m, MF_STRING, MENU_EXIT, L"退出");
 
     POINT pt;
@@ -1931,6 +1935,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case MENU_RESET:
             reset_all();
             break;
+        case MENU_UNINSTALL:
+            uninstall();
+            break;
         case MENU_HIST_CLEAR:
             clear_history();
             break;
@@ -2071,6 +2078,34 @@ static void reset_all(void)
     tray_sync();
     do_scan();
     notify_tip(L"已重置所有信息", L"历史记录与电量缓存已清空。", NIIF_INFO);
+}
+
+/* 卸载：清空注册表数据、移除开机自启，并把 exe 标记为下次重启删除。
+   程序运行中删不掉自己（exe 被文件锁占用），所以用 MoveFileEx 的延迟删除；
+   注册表残留当时就清干净了，exe 在下次重启时被 Windows 自动删除。 */
+static void uninstall(void)
+{
+    int r = MessageBoxW(g_hwnd,
+        L"将删除本程序的全部数据（使用统计、设置、缓存），\n"
+        L"并移除开机自启。程序文件会在下次重启时自动删除。\n\n"
+        L"确定要卸载吗？",
+        L"BattTray 卸载", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+    if (r != IDYES)
+        return;
+
+    /* 1. 删掉整个数据键（含子键，RegDeleteTree 连值一起清） */
+    RegDeleteTreeW(HKEY_CURRENT_USER, kRegKey);
+
+    /* 2. 移除开机自启 */
+    autostart_apply(FALSE);
+
+    /* 3. 标记 exe 下次重启删除 */
+    WCHAR path[MAX_PATH];
+    if (GetModuleFileNameW(NULL, path, MAX_PATH))
+        MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+
+    /* 4. 退出。销毁窗口 → 消息循环结束，退出路径不会再写回注册表。 */
+    DestroyWindow(g_hwnd);
 }
 
 /* ---------------- 入口 ---------------- */
