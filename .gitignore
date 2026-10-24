@@ -29,3 +29,7 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# 在 git-bash 里误用 `>nul` 会真的生成一个名为 nul 的文件，
+# 而 Windows 不允许按普通文件名删除它，先忽略掉。
+/nul
