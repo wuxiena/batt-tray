@@ -118,6 +118,7 @@ static ULONGLONG  g_lastFlush;         /* 上次把使用时长落盘的时刻 *
 static HIST       g_hist[HIST_MAX];
 static BOOL       g_orphanOn;          /* 一台设备都没有时留下的入口图标 */
 static HICON      g_orphanIcon;
+static BOOL       g_uninstalling;      /* 正在走卸载流程，退出时别再把数据写回注册表 */
 
 /* 后台工作线程：执行会阻塞的「扫描 + 主动查询」，UI 线程只异步消费结果，
    这样任何一次查询卡住都不会冻结托盘图标和菜单。 */
@@ -1351,11 +1352,15 @@ static DWORD WINAPI worker_proc(LPVOID p)
         if (g_workerQuit)
             break;
 
+        /* 手动重置事件：扫描与查询可能在同一时刻各发一次唤醒，自动重置事件会把
+           第二次唤醒吞掉，导致轮询请求丢失（最坏要等下一轮定时才被救回来）。
+           这里显式 ResetEvent 后把两种请求都在本次循环里消费掉。 */
+        ResetEvent(g_evWake);
+
         if (InterlockedExchange(&g_reqScan, 0)) {
             prov_close();
             int n = prov_scan();
             PostMessageW(g_hwnd, WM_SCAN_DONE, (WPARAM)n, 0);
-            continue;
         }
 
         if (InterlockedExchange(&g_reqPoll, 0)) {
@@ -1412,6 +1417,12 @@ static void scan_done(int newN)
     }
 
     for (int i = 0; i < g_n; i++) {
+        /* 复用旧槽位时 g_slot[i].icon 是上一轮的句柄（rebuild_slots 拷过来的），
+           直接覆盖会泄漏，先释放再画。 */
+        if (g_slot[i].icon) {
+            DestroyIcon(g_slot[i].icon);
+            g_slot[i].icon = NULL;
+        }
         g_slot[i].icon = build_icon(g_slot[i].level, !g_slot[i].linked);
         /* 扫描花掉的时间不该算进离线判定，给新上线的设备一段宽限 */
         if (!g_slot[i].linked)
@@ -1791,6 +1802,10 @@ static void uninstall(void)
     if (r != IDYES)
         return;
 
+    /* 标记卸载中：退出路径（done 标签）最后会把本次会话的使用时长结算进
+       注册表，那会重新创建 H0..H11；这里记下状态，done 末尾再清一次。 */
+    g_uninstalling = TRUE;
+
     /* 1. 删掉整个数据键（含子键，RegDeleteTree 连值一起清） */
     RegDeleteTreeW(HKEY_CURRENT_USER, kRegKey);
 
@@ -1867,7 +1882,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     prov_set_poll_ms(g_pollMs);
 
     /* 启动后台工作线程：扫描 + 主动查询都在里面做，UI 线程不碰阻塞 IO */
-    g_evWake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    /* 手动重置：worker 每次被唤醒后自己 ResetEvent，确保「同一时刻的多次
+       请求」不会被自动重置事件吞掉（见 worker_proc）。 */
+    g_evWake = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (g_evWake)
         g_worker = CreateThread(NULL, 0, worker_proc, NULL, 0, NULL);
 
@@ -1959,6 +1976,12 @@ done:
         if (g_slot[i].icon)
             DestroyIcon(g_slot[i].icon);
     }
+
+    /* 卸载流程：done 末尾的结算（slot_settle → hist_save）会重写历史键，
+       这里把整个数据键再删一次，确保卸载后注册表零残留。 */
+    if (g_uninstalling)
+        RegDeleteTreeW(HKEY_CURRENT_USER, kRegKey);
+
     if (g_mutex)
         CloseHandle(g_mutex);
     return 0;
