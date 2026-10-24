@@ -31,6 +31,7 @@
 #define MENU_IV_BASE     200     /* 刷新间隔：200 .. 200+N-1 */
 #define MENU_STATS      10       /* 使用统计子菜单 */
 #define MENU_HIST_CLEAR 11       /* 清除历史连接记录 */
+#define MENU_RESET      12       /* 重置所有信息 */
 #define MENU_HIST_BASE  300      /* 统计条目（灰色，仅展示）：300 .. 300+HIST_MAX-1 */
 
 /* 离线判定。无线设备关机后接收器还在枚举，所以只能靠「还有没有回应」判断：
@@ -129,6 +130,8 @@ static int        g_dpi = 96;
 static int        g_dia = FLOAT_DIA;
 
 #define STAMP_UNIT 600000000ULL
+
+static void reset_all(void);   /* 前置声明：定义在缓存恢复一节 */
 
 static DWORD stamp_now(void)
 {
@@ -1140,6 +1143,7 @@ static void show_menu(int i)
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, MENU_RESCAN, L"重新扫描设备");
+    AppendMenuW(m, MF_STRING, MENU_RESET, L"重置所有信息");
     AppendMenuW(m, MF_STRING, MENU_DIAG, L"导出诊断信息…");
     AppendMenuW(m, MF_STRING, MENU_EXIT, L"退出");
 
@@ -1671,9 +1675,8 @@ static ULONGLONG active_timeout(void)
 }
 
 /* 断连判定。
-   关键前提：只对「读到过电量」的设备判定——像西伯利亚 K03S、天剑PLUS 这种
-   dongle 根本不提供电量通道的设备，再怎么问也没有回应，分不清是关机还是
-   本来就不支持，它们按用户要求常驻列表做说明。
+   只对「读到过电量」的设备判定——读不到电量的设备在协议层扫描时就已经被
+   过滤掉、根本不进列表，所以这里不会遇到 level<0 的槽位。
    设备真的关机/断开才走这里：停表、撤图标、从菜单里去掉。 */
 static void check_offline(ULONGLONG now)
 {
@@ -1925,6 +1928,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case MENU_RESCAN:
             do_scan();
             break;
+        case MENU_RESET:
+            reset_all();
+            break;
         case MENU_HIST_CLEAR:
             clear_history();
             break;
@@ -2042,6 +2048,29 @@ static void save_cache_names(void)
         }
         reg_set_str(key, d.brand);
     }
+}
+
+/* 重置所有信息：清空历史/使用时长、电量缓存，并把当前所有设备按离线处理
+   后重新扫描。设置类（浮窗开关、刷新间隔、开机自启）保留不动。 */
+static void reset_all(void)
+{
+    ZeroMemory(g_hist, sizeof(g_hist));
+    hist_save();
+
+    for (int i = 0; i < PROV_MAX; i++) {
+        WCHAR key[16];
+        wsprintfW(key, L"N%d", i); reg_set_str(key, L"");
+        wsprintfW(key, L"L%d", i); reg_set(key, 0xFFFFFFFFu);
+        wsprintfW(key, L"S%d", i); reg_set(key, 0);
+    }
+    for (int i = 0; i < g_n; i++) {
+        if (!g_slot[i].dead)
+            slot_mark_dead(i);
+    }
+    ensure_sel();
+    tray_sync();
+    do_scan();
+    notify_tip(L"已重置所有信息", L"历史记录与电量缓存已清空。", NIIF_INFO);
 }
 
 /* ---------------- 入口 ---------------- */

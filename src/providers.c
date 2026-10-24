@@ -1765,6 +1765,12 @@ int prov_scan(void)
 
         DEVENT tmp;
         if (match_group(col, idx, gn, mask, &tmp)) {
+            /* 读不到电量的设备直接不列（如西伯利亚 K03S 这种不提供电量通道的
+               dongle，耳机关机时接收器还在枚举，但怎么问都没有回应）。 */
+            if (tmp.lastLevel < 0) {
+                dev_free(&tmp);
+                continue;
+            }
             if (g_ndev < PROV_MAX) {
                 g_dev[g_ndev] = tmp;
                 g_ndev++;
@@ -1797,22 +1803,8 @@ int prov_scan(void)
             READING r;
             ZeroMemory(&r, sizeof(r));
             if (!xi_read(i, &r)) {
-                /* 读不到电量不等于没插手柄：登记一台「不可读」的，
-                   让右键菜单能说明原因，而不是让它凭空消失。 */
-                BOOL wired = FALSE;
-                if (!xi_connected(i, &wired))
-                    continue;
-                DEVENT *d = &g_dev[g_ndev];
-                ZeroMemory(d, sizeof(*d));
-                d->kind = K_XINPUT;
-                d->xiIndex = i;
-                lstrcpyW(d->brand, L"Xbox / XInput");
-                lstrcpyW(d->type, L"手柄");
-                lstrcpyW(d->detail, wired ? L"XInput · 系统报「有线」，读不到电量"
-                                          : L"XInput · 手柄未上报电量");
-                d->lastLevel = -1;
-                logf(L"match XINPUT idx=%lu 无电量 (wired=%d)", i, (int)wired);
-                g_ndev++;
+                /* 读不到电量就不列——用户要求「无法显示电量的直接不显示」。 */
+                logf(L"skip XINPUT idx=%lu 无电量", i);
                 continue;
             }
             DEVENT *d = &g_dev[g_ndev];
