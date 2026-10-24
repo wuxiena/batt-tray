@@ -25,10 +25,24 @@ set "ZIG_LOCAL_CACHE_DIR=%~dp0.zigcache"
 if not exist "dist" mkdir "dist"
 
 "%ZIG%" cc -target x86_64-windows-gnu -O2 -s -Wl,--subsystem,windows ^
-    -o dist\BattTray.exe src\BattTray.c src\providers.c src\app_icon.c ^
+    -o dist\BattTray.exe src\BattTray.c src\providers.c ^
     -luser32 -lshell32 -lgdi32 -ladvapi32 -lhid -lsetupapi -lm
 if errorlevel 1 (
     echo BUILD FAILED
+    exit /b 1
+)
+
+rem Embed the app icon into the exe resource section (RT_GROUP_ICON + RT_ICON).
+rem Uses Win32 UpdateResource, so no rc.exe / windres / llvm-rc is needed.
+if not exist "build" mkdir "build"
+"%ZIG%" cc -target x86_64-windows-gnu -O2 -s -o build\embedres.exe tools\embedres.c
+if errorlevel 1 (
+    echo BUILD FAILED - embedres
+    exit /b 1
+)
+build\embedres.exe dist\BattTray.exe src\res\app.ico
+if errorlevel 1 (
+    echo EMBED ICON FAILED
     exit /b 1
 )
 

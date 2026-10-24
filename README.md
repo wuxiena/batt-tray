@@ -66,12 +66,11 @@
 | 索尼 DualShock 4 / DualSense | 输入报文电量字段 | ⚠️ 按公开资料实现 |
 | Xbox 及 XInput 兼容手柄 | 系统 API（4 档粗粒度） | ✅ 通用回退 |
 | 蓝牙耳机（AirPods、索尼 WH/WF 等） | Windows 电池类接口 | ✅ 通用回退 |
-| 西伯利亚 K03S、天剑PLUS 等 | dongle 不提供电量通道 | ❌ 确认读不到 |
 
 - ⚠️ 项未在本机实机验证，按「尽力兼容」处理：解析失败不会显示可疑数字，只会回退到
   Windows 电池接口或标为「不可读」。
-- 读不到电量的设备（最后一行）不占托盘图标，只在右键菜单注明；电量请看设备自身
-  的指示灯或官方 App。
+- 读不到电量的设备不占托盘图标，只在右键菜单注明；电量请看设备自身的
+  指示灯或官方 App。
 
 ## 常见问题
 
@@ -80,7 +79,7 @@ Windows 11 默认把新图标收进「隐藏的图标」区（`^`）。点开 `^
 或在 设置 → 个性化 → 任务栏 → 其它系统托盘图标 里打开常显。
 
 **为什么我的耳机 / 手柄不显示电量？**
-部分厂商的 2.4G dongle 根本不把电量交给电脑（如西伯利亚 K03S、天剑PLUS，均实测确认），
+部分厂商的 2.4G dongle 根本不把电量交给电脑（已实测确认），
 XInput 还常谎报「有线 / 满电」。这类设备程序不编数字：菜单里列一行「电量不可读」并注明原因。
 
 **程序会不会很耗电？**
@@ -93,8 +92,11 @@ build.cmd
 ```
 
 使用 [zig](https://ziglang.org/download/) 交叉编译（优先 `toolchain\ziglang\zig.exe`，否则 PATH 上的 `zig.exe`），
-不需要 Visual Studio，产物为 `dist\BattTray.exe`。应用图标由 `tools/make_icon.py` 生成到
-`src/app_icon.c`（字节数组，运行时 `CreateIconFromResourceEx` 构建）。
+不需要 Visual Studio，产物为 `dist\BattTray.exe`。
+
+应用图标：`tools/make_icon.py` 生成 `src\res\app.ico`，构建时由 `tools\embedres.c`
+经 Win32 `UpdateResource` 写进 exe 的资源段（RT_GROUP_ICON + RT_ICON），
+所以资源管理器 / 任务栏 / Alt+Tab 显示的都是电池图标。
 
 调试宏：`-DBATT_SIM`（模拟上报帧验证 UI）、`-DBATT_FAKE`（注入 4 台假设备验证多图标布局）。
 

@@ -12,6 +12,7 @@
 *.o
 /tools/*.exe
 /tools/*.pdb
+/build/
 
 # --- local debugging artifacts ---
 *.log

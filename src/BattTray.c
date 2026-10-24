@@ -2046,55 +2046,15 @@ static void save_cache_names(void)
 
 /* ---------------- 入口 ---------------- */
 
-/* exe 内嵌的应用图标：make_icon.py 生成的整个 .ico 文件以字节数组形式编进程序。
-   不走资源段是因为构建机上 zig rc 不可用、lld 又会忽略手工 COFF 资源对象的重定位，
-   运行时用 CreateIconFromResourceEx 解析是最省事的路子。 */
-extern const unsigned char kAppIco[];
-extern const unsigned int  kAppIcoLen;
-
-static HICON app_icon(int cx, int cy)
+/* 应用图标：编译后由 tools/embedres.c 写进 exe 的资源段
+   （RT_GROUP_ICON id 1 + 若干 RT_ICON），运行时直接按 ID 加载。
+   这样 exe 在资源管理器 / 任务栏 / Alt+Tab 里都是电池图标。 */
+static HICON app_icon(HINSTANCE inst, int cx, int cy)
 {
-    int n = 0;
-    if (kAppIcoLen > 6)
-        n = kAppIco[4] | (kAppIco[5] << 8);
-    for (int k = 0; k < n; k++) {
-        const unsigned char *e = kAppIco + 6 + 16 * k;
-        int w = e[0] ? e[0] : 256;               /* 0 表示 256 */
-        int h = e[1] ? e[1] : 256;
-        if (w != cx || h != cy)
-            continue;
-        DWORD off = (DWORD)e[12] | ((DWORD)e[13] << 8) | ((DWORD)e[14] << 16) |
-                    ((DWORD)e[15] << 24);
-        DWORD len = (DWORD)e[8]  | ((DWORD)e[9]  << 8) | ((DWORD)e[10] << 16) |
-                    ((DWORD)e[11] << 24);
-        if (off + len > kAppIcoLen)
-            break;
-        HICON ic = CreateIconFromResourceEx((PBYTE)kAppIco + off, len, TRUE,
-                                            0x00030000, cx, cy, LR_DEFAULTCOLOR);
-        if (ic)
-            return ic;
-    }
-    /* 尺寸没匹配上就挑最接近的：不超过请求里最大的那个，再不行退系统图标 */
-    int best = -1, bestw = 0;
-    for (int k = 0; k < n; k++) {
-        const unsigned char *e = kAppIco + 6 + 16 * k;
-        int w = e[0] ? e[0] : 256;
-        if ((w <= cx && w >= bestw) || best < 0) {
-            best = k;
-            bestw = w;
-        }
-    }
-    if (best >= 0) {
-        const unsigned char *e = kAppIco + 6 + 16 * best;
-        DWORD len = (DWORD)e[8] | ((DWORD)e[9] << 8) | ((DWORD)e[10] << 16) |
-                    ((DWORD)e[11] << 24);
-        DWORD off = (DWORD)e[12] | ((DWORD)e[13] << 8) | ((DWORD)e[14] << 16) |
-                    ((DWORD)e[15] << 24);
-        HICON ic = CreateIconFromResourceEx((PBYTE)kAppIco + off, len, TRUE,
-                                            0x00030000, cx, cy, LR_DEFAULTCOLOR);
-        if (ic)
-            return ic;
-    }
+    HICON ic = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, cx, cy,
+                                 LR_DEFAULTCOLOR);
+    if (ic)
+        return ic;
     return LoadIconW(NULL, IDI_APPLICATION);
 }
 
@@ -2124,8 +2084,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.lpszClassName = kClass;
-    wc.hIcon   = app_icon(32, 32);   /* 任务栏 / Alt+Tab / 资源管理器 */
-    wc.hIconSm = app_icon(16, 16);   /* 标题栏小图标 */
+    wc.hIcon   = app_icon(inst, 32, 32);   /* 任务栏 / Alt+Tab / 资源管理器 */
+    wc.hIconSm = app_icon(inst, 16, 16);   /* 标题栏小图标 */
     RegisterClassExW(&wc);
 
     g_hwnd = CreateWindowExW(0, kClass, L"BattTray", WS_OVERLAPPED,
