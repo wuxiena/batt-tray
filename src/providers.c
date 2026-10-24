@@ -1971,6 +1971,16 @@ BOOL prov_read_ready(int i, READING *r)
     return r->valid;
 }
 
+/* 离线设备的复活探测要能真的发一帧：不清掉退避的话，那些「连续失败就降频」
+   的协议族会直接把请求吞掉，界面层永远等不到回应。 */
+void prov_reset_backoff(int i)
+{
+    if (i < 0 || i >= PROV_MAX)
+        return;
+    g_v90fail[i] = 0;
+    g_gsrFail[i] = 0;
+}
+
 BOOL prov_poll(int i, READING *r)
 {
     r->valid = FALSE;
