@@ -104,8 +104,10 @@ static int   g_logLen;
 /* XInput 动态加载 */
 typedef struct { BYTE type; BYTE level; } XIBAT;
 typedef DWORD (WINAPI *XI_GETBAT)(DWORD, BYTE, XIBAT *);
-static XI_GETBAT g_xiBat;
-static BOOL      g_xiTried;
+typedef DWORD (WINAPI *XI_GETSTATE)(DWORD, void *);
+static XI_GETBAT   g_xiBat;
+static XI_GETSTATE g_xiState;
+static BOOL        g_xiTried;
 
 static void logf(const WCHAR *fmt, ...)
 {
@@ -993,6 +995,8 @@ static BOOL xi_init(void)
         if (!m)
             continue;
         g_xiBat = (XI_GETBAT)GetProcAddress(m, "XInputGetBatteryInformation");
+        if (!g_xiState)
+            g_xiState = (XI_GETSTATE)GetProcAddress(m, "XInputGetState");
         if (!g_xiBat) {
             /* 该版本没有电量接口，保持模块已加载无妨，继续下一个 */
         }
@@ -1023,6 +1027,31 @@ static BOOL xi_read(DWORD idx, READING *r)
     }
     r->charging = 0;
     r->valid = TRUE;
+    return TRUE;
+}
+
+/* 手柄确实连着、但电量读不出来。
+   大量第三方 2.4G dongle 会直接用 XINPUT_BATTERY_INFORMATION 谎报
+   type=WIRED / level=FULL（天剑PLUS 实测如此），所以只能靠有无手柄在线来区分，
+   不能把 type==WIRED 当作「没插手柄」。 */
+static BOOL xi_connected(DWORD idx, BOOL *wired)
+{
+    if (wired)
+        *wired = FALSE;
+    if (!g_xiState)
+        return FALSE;
+
+    BYTE state[32];               /* XINPUT_STATE 只有 16 字节，留足余量 */
+    ZeroMemory(state, sizeof(state));
+    if (g_xiState(idx, state) != ERROR_SUCCESS)
+        return FALSE;
+
+    if (wired && g_xiBat) {
+        XIBAT b;
+        ZeroMemory(&b, sizeof(b));
+        if (g_xiBat(idx, 0, &b) == ERROR_SUCCESS && b.type == 1)
+            *wired = TRUE;
+    }
     return TRUE;
 }
 
@@ -1638,12 +1667,30 @@ int prov_scan(void)
     }
 
     /* XInput 手柄（Xbox / 北通 / 飞智等 XInput 模式） */
+    BOOL xiGood = FALSE;
     if (xi_init()) {
         for (DWORD i = 0; i < 4 && g_ndev < PROV_MAX; i++) {
             READING r;
             ZeroMemory(&r, sizeof(r));
-            if (!xi_read(i, &r))
+            if (!xi_read(i, &r)) {
+                /* 读不到电量不等于没插手柄：登记一台「不可读」的，
+                   让右键菜单能说明原因，而不是让它凭空消失。 */
+                BOOL wired = FALSE;
+                if (!xi_connected(i, &wired))
+                    continue;
+                DEVENT *d = &g_dev[g_ndev];
+                ZeroMemory(d, sizeof(*d));
+                d->kind = K_XINPUT;
+                d->xiIndex = i;
+                lstrcpyW(d->brand, L"Xbox / XInput");
+                lstrcpyW(d->type, L"手柄");
+                lstrcpyW(d->detail, wired ? L"XInput · 系统报「有线」，读不到电量"
+                                          : L"XInput · 手柄未上报电量");
+                d->lastLevel = -1;
+                logf(L"match XINPUT idx=%lu 无电量 (wired=%d)", i, (int)wired);
+                g_ndev++;
                 continue;
+            }
             DEVENT *d = &g_dev[g_ndev];
             ZeroMemory(d, sizeof(*d));
             d->kind = K_XINPUT;
@@ -1652,13 +1699,14 @@ int prov_scan(void)
             lstrcpyW(d->type, L"手柄");
             lstrcpyW(d->detail, L"XInput · 系统电量接口（粗粒度 4 档）");
             d->lastLevel = r.level;
+            xiGood = TRUE;
             logf(L"match XINPUT idx=%lu level=%d", i, r.level);
             g_ndev++;
         }
     }
 
     /* 通用兜底：Windows 电池类设备 */
-    winbat_scan(claimedVid, claimedPid, nClaimed, g_ndev > 0);
+    winbat_scan(claimedVid, claimedPid, nClaimed, xiGood);
 
 #ifdef BATT_FAKE
     /* 调试构建专用：伪造几台设备，用来检查多图标布局与悬停提示。

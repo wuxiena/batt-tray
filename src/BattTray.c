@@ -960,9 +960,14 @@ static void show_menu(int i)
             UINT flags = MF_STRING;
             if (s->level < 0) {
                 flags |= MF_GRAYED;          /* 没电量可选，只做说明 */
-                wsprintfW(t, L"%s %s · %s", d.brand, d.type,
-                          text_has(d.detail, L"无应答") ? L"电量不可读（dongle 不提供）"
-                                                        : L"电量不可读");
+                const WCHAR *why = L"电量不可读";
+                if (text_has(d.detail, L"无应答"))
+                    why = L"电量不可读（dongle 不提供）";
+                else if (text_has(d.detail, L"未上报"))
+                    why = L"电量不可读（手柄不提供）";
+                else if (text_has(d.detail, L"有线"))
+                    why = L"电量不可读（有线连接）";
+                wsprintfW(t, L"%s %s · %s", d.brand, d.type, why);
             } else {
                 if (k == g_sel)
                     flags |= MF_CHECKED;
