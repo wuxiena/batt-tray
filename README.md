@@ -107,7 +107,7 @@ ATK / VXE / VGN / 迈从 / 飞智、索尼 DualSense、Xbox 手柄以及通用�
 
 | 品牌 / 方案 | 识别条件 | 协议 | 状态 |
 | --- | --- | --- | --- |
-| 0xFF90 厂商通道耳机 dongle（MCHOSE V9 Pro 同族） | 音频集合 + `FF90/0001` + 64 字节收发 | `55 65 01 00` → `55 65 <电量> <状态>` | ⚠️ 协议有公开逆向记录，未实机 |
+| 0xFF90 厂商通道耳机 dongle（MCHOSE V9 Pro 同族） | 音频集合 + `FF90/0001` + 64 字节收发 | `55 65 01 00` → `55 65 <电量> <状态>` | ⚠️ 实测西伯利亚 K03S 收帧不回话 |
 | 索尼 DualShock 4 / DualSense | `054C` + `01/04`、`01/05` | 输入报文 `0x1E`（DS4）/ `0x36`（DualSense） | ⚠️ 同上 |
 | Xbox 及 XInput 兼容手柄 | `XInputGetBatteryInformation` | 系统 API，4 档 → 5/25/60/100% | ✅ 通用回退 |
 | 天剑PLUS / Leadjoy Xeno Plus（`4131` LiteEMF 方案） | `4131:3519` + XInput | XInput 谎报「有线 / 满电」，厂商通道无电量命令 | ⚠️ 实机确认：读不到 |
