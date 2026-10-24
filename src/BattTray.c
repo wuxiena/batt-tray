@@ -19,6 +19,8 @@
 
 #define WM_TRAY          (WM_APP + 1)
 #define WM_RESCAN        (WM_APP + 2)
+#define WM_SCAN_DONE     (WM_APP + 3)   /* 工作线程：扫描完成 */
+#define WM_POLL_DONE     (WM_APP + 4)   /* 工作线程：主动查询完成 */
 
 #define MENU_DEV_BASE    100
 #define MENU_PROTO       20
@@ -117,10 +119,31 @@ static HIST       g_hist[HIST_MAX];
 static BOOL       g_orphanOn;          /* 一台设备都没有时留下的入口图标 */
 static HICON      g_orphanIcon;
 
+/* 后台工作线程：执行会阻塞的「扫描 + 主动查询」，UI 线程只异步消费结果，
+   这样任何一次查询卡住都不会冻结托盘图标和菜单。 */
+static HANDLE     g_worker;            /* 工作线程句柄 */
+static HANDLE     g_evWake;            /* 唤醒工作线程的事件 */
+static volatile LONG g_workerQuit;     /* 退出标志 */
+static volatile LONG g_reqScan;        /* 请求扫描 */
+static volatile LONG g_reqPoll;        /* 请求查询 */
+static volatile LONG g_pollMask;       /* 请求查询的设备位掩码（bit i = 查设备 i） */
+static volatile LONG g_scanBusy;       /* 扫描请求在途，防重复 */
+
+/* 查询结果共享缓冲区：工作线程写，UI 线程读（g_resNew 用原子标志做同步） */
+static READING    g_res[PROV_MAX];
+static volatile LONG g_resNew[PROV_MAX];
+
+/* 扫描快照：do_scan 时保存旧槽位，WM_SCAN_DONE 里据此复用图标/时长 */
+static SLOT       g_prev[PROV_MAX];
+static WCHAR      g_prevKey[PROV_MAX][96];
+static int        g_prevN;
+
 #define STAMP_UNIT 600000000ULL
 
 static void reset_all(void);   /* 前置声明：定义在缓存恢复一节 */
 static void uninstall(void);   /* 前置声明：定义在缓存恢复一节 */
+static void load_cache(void);  /* 前置声明：定义在缓存恢复一节 */
+static void save_cache_names(void);
 
 static DWORD stamp_now(void)
 {
@@ -1301,70 +1324,115 @@ static void rebuild_slots(int prevN, SLOT *prev, WCHAR prevKey[][96])
         ZeroMemory(&g_slot[i], sizeof(SLOT));
 }
 
-static void do_scan(void)
+/* ---------------- 后台工作线程 ----------------
+   把「扫描（prov_scan，内含各协议族的探测查询）」和「主动查询（prov_poll）」
+   从 UI 线程挪到这里。UI 线程通过 g_reqScan / g_reqPoll + g_evWake 下发任务，
+   结果经 PostMessage 异步回传，绝不阻塞消息循环——所以任何一次查询卡住
+   （比如雷蛇的同步 feature 报告在设备不响应时挂起数秒）都不会冻结托盘。 */
+
+static void request_scan(void)
 {
-    SLOT prev[PROV_MAX];
-    WCHAR prevKey[PROV_MAX][96];
-    int prevN = g_n;
+    InterlockedExchange(&g_reqScan, 1);
+    SetEvent(g_evWake);
+}
 
-    CopyMemory(prev, g_slot, sizeof(prev));
-    for (int i = 0; i < prevN; i++) {
-        DEVDESC d;
-        prevKey[i][0] = 0;
-        if (dev_info(i, &d))
-            wsprintfW(prevKey[i], L"%s|%s", d.brand, d.type);
-    }
+static void request_poll_mask(LONG mask)
+{
+    InterlockedOr(&g_pollMask, mask);
+    InterlockedExchange(&g_reqPoll, 1);
+    SetEvent(g_evWake);
+}
 
-    prov_close();
-    g_n = prov_scan();
+static DWORD WINAPI worker_proc(LPVOID p)
+{
+    (void)p;
+    for (;;) {
+        WaitForSingleObject(g_evWake, INFINITE);
+        if (g_workerQuit)
+            break;
 
-    rebuild_slots(prevN, prev, prevKey);
+        if (InterlockedExchange(&g_reqScan, 0)) {
+            prov_close();
+            int n = prov_scan();
+            PostMessageW(g_hwnd, WM_SCAN_DONE, (WPARAM)n, 0);
+            continue;
+        }
 
-    tray_sync_promote();
-
-    /* 首次读数：被动型挂起监听，其余立即查一次 */
-    for (int i = 0; i < g_n; i++) {
-        if (prov_is_passive(i)) {
-            prov_arm(i);
-        } else {
-            READING r;
-            ZeroMemory(&r, sizeof(r));
-            if (prov_poll(i, &r))
-                apply_reading(i, &r);
+        if (InterlockedExchange(&g_reqPoll, 0)) {
+            LONG mask = InterlockedExchange(&g_pollMask, 0);
+            int n = prov_count();
+            for (int i = 0; i < n && i < PROV_MAX; i++) {
+                if (!(mask & (1 << i)))
+                    continue;
+                if (prov_is_passive(i))
+                    continue;
+                READING r;
+                ZeroMemory(&r, sizeof(r));
+                prov_poll(i, &r);
+                g_res[i] = r;
+                InterlockedExchange(&g_resNew[i], 1);
+            }
+            PostMessageW(g_hwnd, WM_POLL_DONE, 0, 0);
         }
     }
+    return 0;
+}
+
+static void do_scan(void)
+{
+    if (InterlockedExchange(&g_scanBusy, 1))
+        return;              /* 已有扫描在途，等 WM_SCAN_DONE */
+
+    g_prevN = g_n;
+    CopyMemory(g_prev, g_slot, sizeof(g_prev));
+    for (int i = 0; i < g_prevN; i++) {
+        DEVDESC d;
+        g_prevKey[i][0] = 0;
+        if (dev_info(i, &d))
+            wsprintfW(g_prevKey[i], L"%s|%s", d.brand, d.type);
+    }
+
+    request_scan();          /* 真正的枚举 + 探测在工作线程里做 */
+}
+
+/* 扫描完成后（WM_SCAN_DONE）：重建槽位、恢复缓存、挂起被动监听、发起首次读数 */
+static void scan_done(int newN)
+{
+    BOOL first = (g_lastScan == 0);
+
+    g_n = newN;
+    rebuild_slots(g_prevN, g_prev, g_prevKey);
+
+    for (int i = 0; i < g_n; i++)
+        g_slot[i].passive = prov_is_passive(i);
+
+    if (first) {
+        load_cache();
+        save_cache_names();
+    }
+
+    for (int i = 0; i < g_n; i++) {
+        g_slot[i].icon = build_icon(g_slot[i].level, !g_slot[i].linked);
+        /* 扫描花掉的时间不该算进离线判定，给新上线的设备一段宽限 */
+        if (!g_slot[i].linked)
+            g_slot[i].lastTick = GetTickCount64();
+    }
+    tray_sync_promote();
+
+    for (int i = 0; i < g_n; i++)
+        if (prov_is_passive(i))
+            prov_arm(i);
 
     g_lastScan = GetTickCount64();
     g_nextPoll = g_lastScan + (ULONGLONG)g_pollMs;
+    g_lastFlush = g_lastScan;
 
-    /* 刚扫完给所有设备一段宽限：扫描本身花掉的时间不该算进离线判定 */
+    /* 主动型设备的首次读数，工作线程里做 */
+    LONG mask = 0;
     for (int i = 0; i < g_n; i++)
-        if (!g_slot[i].linked)
-            g_slot[i].lastTick = g_lastScan;
-}
-
-static void poll_all(void)
-{
-    ULONGLONG now = GetTickCount64();
-    for (int i = 0; i < g_n; i++) {
-        if (g_slot[i].dead || prov_is_passive(i))
-            continue;
-        READING r;
-        ZeroMemory(&r, sizeof(r));
-        if (prov_poll(i, &r)) {
-            g_slot[i].fail = 0;
-            apply_reading(i, &r);
-        } else {
-            g_slot[i].fail++;
-            /* 连读两次失败、且距上次成功已超过 90 秒，才认为设备睡了/走了。
-               间隔调长以后，一次偶发失败不该让图标立刻变暗。 */
-            if (g_slot[i].linked && g_slot[i].fail >= 2 &&
-                now - g_slot[i].lastTick > 90000) {
-                g_slot[i].linked = FALSE;
-                slot_update(i);
-            }
-        }
-    }
+        if (!prov_is_passive(i))
+            mask |= (1 << i);
+    request_poll_mask(mask);
 }
 
 /* 主动查询型设备两次成功读数之间的兜底时限：轮询间隔拉长时跟着放宽，
@@ -1375,44 +1443,39 @@ static ULONGLONG active_timeout(void)
     return v < 90000ULL ? 90000ULL : v;
 }
 
-/* 断连判定。
-   只对「读到过电量」的设备判定——读不到电量的设备在协议层扫描时就已经被
-   过滤掉、根本不进列表，所以这里不会遇到 level<0 的槽位。
-   设备真的关机/断开才走这里：停表、撤图标、从菜单里去掉。 */
-static void check_offline(ULONGLONG now)
+/* WM_POLL_DONE：消费工作线程的查询结果。查询本身在工作线程里做，这里只做
+   状态判定（更新 fail/probe、判离线/复活），不再碰任何可能阻塞的 IO。 */
+static void poll_done(void)
 {
+    ULONGLONG now = GetTickCount64();
     for (int i = 0; i < g_n; i++) {
+        if (!InterlockedExchange(&g_resNew[i], 0))
+            continue;
+        READING r = g_res[i];
         SLOT *s = &g_slot[i];
-        if (s->dead || s->level < 0)
-            continue;
 
-        /* 复查阶段：加密探测，连失 GONE_PROBE_MAX 次才认定离线 */
-        if (s->probe > 0) {
-            if (now < s->nextProbe)
-                continue;
-            s->nextProbe = now + GONE_PROBE_MS;
-            READING r;
-            ZeroMemory(&r, sizeof(r));
-            if (prov_poll(i, &r)) {
-                s->probe = 0;
+        if (s->dead) {
+            /* 复活探测结果：能读到电量就原地复活 */
+            if (r.valid)
                 apply_reading(i, &r);
-            } else if (++s->probe > GONE_PROBE_MAX) {
+            continue;
+        }
+
+        if (r.valid) {
+            s->fail = 0;
+            s->probe = 0;
+            apply_reading(i, &r);
+        } else if (s->probe > 0) {
+            /* 复查阶段：连失 GONE_PROBE_MAX 次认定离线 */
+            if (++s->probe > GONE_PROBE_MAX)
                 slot_mark_dead(i);
+        } else {
+            s->fail++;
+            /* 连读两次失败、且距上次成功已超过 90 秒，才认为设备睡了/走了。 */
+            if (s->linked && s->fail >= 2 && now - s->lastTick > 90000) {
+                s->linked = FALSE;
+                slot_update(i);
             }
-            continue;
-        }
-
-        if (s->passive) {
-            /* 被动型没法主动询问，只能靠「还有没有帧」判断 */
-            if (now - s->lastTick > GONE_PASSIVE_MS)
-                slot_mark_dead(i);
-            continue;
-        }
-
-        /* 主动型：一次查询失败就先别急着下结论，进入复查 */
-        if (s->fail >= 1 || now - s->lastTick > active_timeout()) {
-            s->probe = 1;
-            s->nextProbe = now + GONE_PROBE_MS;
         }
     }
 }
@@ -1420,6 +1483,7 @@ static void check_offline(ULONGLONG now)
 static void tick(void)
 {
     ULONGLONG now = GetTickCount64();
+    LONG mask = 0;
 
     if (g_n == 0) {
         if (now - g_lastScan > 4000)
@@ -1437,10 +1501,7 @@ static void tick(void)
             continue;
         s->nextProbe = now + REVIVE_MS;
         prov_reset_backoff(i);
-        READING r;
-        ZeroMemory(&r, sizeof(r));
-        if (prov_poll(i, &r))
-            apply_reading(i, &r);
+        mask |= (1 << i);
     }
 
     /* 被动型：太久没上报就转成「缓存」显示 */
@@ -1453,12 +1514,45 @@ static void tick(void)
         }
     }
 
+    /* 轮询到期：查所有非被动、非离线设备 */
     if (now >= g_nextPoll) {
         g_nextPoll = now + (ULONGLONG)g_pollMs;
-        poll_all();
+        for (int i = 0; i < g_n; i++)
+            if (!g_slot[i].dead && !prov_is_passive(i))
+                mask |= (1 << i);
     }
 
-    check_offline(now);
+    /* 断连判定调度：
+       - 复查阶段：到期就请求复查查询；
+       - 被动型：3 分钟无帧判死；
+       - 主动型：一次查询失败或超时，进入复查。 */
+    for (int i = 0; i < g_n; i++) {
+        SLOT *s = &g_slot[i];
+        if (s->dead || s->level < 0)
+            continue;
+
+        if (s->probe > 0) {
+            if (now >= s->nextProbe) {
+                s->nextProbe = now + GONE_PROBE_MS;
+                mask |= (1 << i);
+            }
+            continue;
+        }
+
+        if (s->passive) {
+            if (now - s->lastTick > GONE_PASSIVE_MS)
+                slot_mark_dead(i);
+            continue;
+        }
+
+        if (s->fail >= 1 || now - s->lastTick > active_timeout()) {
+            s->probe = 1;
+            s->nextProbe = now + GONE_PROBE_MS;
+        }
+    }
+
+    if (mask)
+        request_poll_mask(mask);
 
     /* 使用时长定期落盘：强杀进程时最多丢 5 分钟，而不是整段会话 */
     if (now - g_lastFlush > FLUSH_MS) {
@@ -1562,6 +1656,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_RESCAN:
         do_scan();
+        return 0;
+
+    case WM_SCAN_DONE:
+        InterlockedExchange(&g_scanBusy, 0);
+        scan_done((int)wp);
+        return 0;
+
+    case WM_POLL_DONE:
+        poll_done();
         return 0;
 
     case WM_DESTROY:
@@ -1763,33 +1866,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     }
     prov_set_poll_ms(g_pollMs);
 
-    /* 先扫描：托盘图标的数量取决于设备数 */
+    /* 启动后台工作线程：扫描 + 主动查询都在里面做，UI 线程不碰阻塞 IO */
+    g_evWake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (g_evWake)
+        g_worker = CreateThread(NULL, 0, worker_proc, NULL, 0, NULL);
+
+    /* 首次扫描走异步：结果经 WM_SCAN_DONE 回来后在 scan_done 里初始化 */
     hist_load();
-    g_n = prov_scan();
-    load_cache();
-    save_cache_names();
-
-    for (int i = 0; i < g_n; i++) {
-        g_slot[i].passive = prov_is_passive(i);
-        g_slot[i].icon = build_icon(g_slot[i].level, !g_slot[i].linked);
-        /* 启动瞬间不能算「很久没上报」，否则第一次 tick 就会把设备判成离线 */
-        g_slot[i].lastTick = GetTickCount64();
-    }
-    tray_sync_promote();
-
-    for (int i = 0; i < g_n; i++) {
-        if (prov_is_passive(i)) {
-            prov_arm(i);
-        } else {
-            READING r;
-            ZeroMemory(&r, sizeof(r));
-            if (prov_poll(i, &r))
-                apply_reading(i, &r);
-        }
-    }
-    g_lastScan = GetTickCount64();
-    g_nextPoll = g_lastScan + (ULONGLONG)g_pollMs;
-    g_lastFlush = g_lastScan;
+    request_scan();
 
 #ifdef BATT_SIM
     SetTimer(g_hwnd, 9, 1500, NULL);
@@ -1829,7 +1913,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
             tick();
             continue;
         }
-        if (cnt && r == WAIT_OBJECT_0 + (DWORD)cnt) {
+        if (r == WAIT_OBJECT_0 + (DWORD)cnt) {
             MSG msg;
             while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
                 if (msg.message == WM_QUIT)
@@ -1845,6 +1929,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     }
 
 done:
+    /* 停工作线程：置退出标志 + 唤醒；等它退出后再动 g_dev，避免竞态 */
+    InterlockedExchange(&g_workerQuit, 1);
+    if (g_evWake)
+        SetEvent(g_evWake);
+    if (g_worker) {
+        WaitForSingleObject(g_worker, INFINITE);
+        CloseHandle(g_worker);
+        g_worker = NULL;
+    }
+    if (g_evWake) {
+        CloseHandle(g_evWake);
+        g_evWake = NULL;
+    }
+
     /* 退出前把最后一段连接时长记下来（必须在 prov_close 之前，还得能取到设备名） */
     for (int i = 0; i < g_n; i++)
         if (!g_slot[i].dead)
