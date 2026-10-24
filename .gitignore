@@ -10,11 +10,17 @@
 /*.obj
 /*.res
 *.o
+/tools/*.exe
+/tools/*.pdb
 
 # --- local debugging artifacts ---
 *.log
 /*_dbg.exe
 /*_sim.exe
+/shots/
+/*.png
+dist/*-diag.txt
+diag.txt
 
 # --- OS / editor ---
 Thumbs.db
