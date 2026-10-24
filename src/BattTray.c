@@ -28,6 +28,21 @@
 #define MENU_RESCAN      4
 #define MENU_EXIT        5
 #define MENU_DIAG        7
+#define MENU_IV_BASE     200     /* 刷新间隔：200 .. 200+N-1 */
+
+/* 主动查询的间隔。每次查询都要把无线设备的射频叫醒一次，间隔越短越费电，
+   所以默认 5 分钟——鼠标/键盘的续航比「秒级刷新」重要得多。
+   被动上报的机型（雷柏、索尼手柄）不受影响：它们本来就在自己推，我们不发包。 */
+static const struct { int ms; const WCHAR *label; } kIntervals[] = {
+    {    3000, L"每 3 秒（最费电）" },
+    {   60000, L"每 1 分钟" },
+    {  300000, L"每 5 分钟" },
+    {  600000, L"每 10 分钟" },
+    { 1800000, L"每 30 分钟" },
+};
+#define IV_COUNT ((int)(sizeof(kIntervals) / sizeof(kIntervals[0])))
+
+static int g_pollMs = 300000;    /* 默认 5 分钟，用户可在右键菜单里改 */
 
 #define TRAY_UID_BASE    100        /* 托盘图标 uID 起点 */
 
@@ -58,6 +73,7 @@ typedef struct {
     int       cachedMin;   /* 启动时从注册表恢复的读数「多少分钟前」 */
     HICON     icon;
     BOOL      lowNotified;
+    int       fail;        /* 连续查询失败次数：避免一次偶发失败就把图标变暗 */
 } SLOT;
 
 static HINSTANCE  g_inst;
@@ -985,6 +1001,15 @@ static void show_menu(int i)
     AppendMenuW(m, MF_STRING | (g_showFloat ? MF_CHECKED : 0), MENU_FLOAT, L"桌面浮窗");
     AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0), MENU_AUTORUN,
                 L"开机自动启动");
+
+    /* 刷新间隔：默认 5 分钟。每次查询都要叫醒无线设备的射频，调太勤会明显吃掉续航。 */
+    {
+        HMENU iv = CreatePopupMenu();
+        for (int k = 0; k < IV_COUNT; k++)
+            AppendMenuW(iv, MF_STRING | (g_pollMs == kIntervals[k].ms ? MF_CHECKED : 0),
+                        MENU_IV_BASE + k, kIntervals[k].label);
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)iv, L"刷新间隔");
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, MENU_RESCAN, L"重新扫描设备");
     AppendMenuW(m, MF_STRING, MENU_DIAG, L"导出诊断信息…");
@@ -1013,6 +1038,7 @@ static void apply_reading(int i, const READING *r)
     SLOT *s = &g_slot[i];
     BOOL wasLinked = s->linked;
     s->linked = TRUE;
+    s->fail = 0;
     s->lastTick = GetTickCount64();
     s->cachedMin = 0;
 
@@ -1106,7 +1132,7 @@ static void do_scan(void)
     }
 
     g_lastScan = GetTickCount64();
-    g_nextPoll = g_lastScan + 3000;
+    g_nextPoll = g_lastScan + (ULONGLONG)g_pollMs;
 
     if (g_float && IsWindowVisible(g_float))
         float_render();
@@ -1114,16 +1140,22 @@ static void do_scan(void)
 
 static void poll_all(void)
 {
+    ULONGLONG now = GetTickCount64();
     for (int i = 0; i < g_n; i++) {
         if (prov_is_passive(i))
             continue;
         READING r;
         ZeroMemory(&r, sizeof(r));
-        if (prov_poll(i, &r))
+        if (prov_poll(i, &r)) {
+            g_slot[i].fail = 0;
             apply_reading(i, &r);
-        else if (g_slot[i].linked && GetTickCount64() - g_slot[i].lastTick > 90000) {
-            g_slot[i].linked = FALSE;
-            slot_update(i);
+        } else if (g_slot[i].linked) {
+            /* 连读两次失败、且距上次成功已超过 90 秒，才认为设备睡了/走了。
+               间隔调长以后，一次偶发失败不该让图标立刻变暗。 */
+            if (++g_slot[i].fail >= 2 && now - g_slot[i].lastTick > 90000) {
+                g_slot[i].linked = FALSE;
+                slot_update(i);
+            }
         }
     }
 }
@@ -1149,7 +1181,7 @@ static void tick(void)
     }
 
     if (now >= g_nextPoll) {
-        g_nextPoll = now + 20000;
+        g_nextPoll = now + (ULONGLONG)g_pollMs;
         poll_all();
     }
 }
@@ -1272,6 +1304,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 }
                 float_apply_visible();
             }
+            return 0;
+        }
+        if (id >= MENU_IV_BASE && id < MENU_IV_BASE + IV_COUNT) {
+            g_pollMs = kIntervals[id - MENU_IV_BASE].ms;
+            reg_set(L"IV", (DWORD)g_pollMs);
+            prov_set_poll_ms(g_pollMs);
+            g_nextPoll = GetTickCount64();      /* 换完立刻按新间隔读一次 */
             return 0;
         }
         switch (id) {
@@ -1445,6 +1484,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     if (!g_font)
         g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
+    /* 刷新间隔：读注册表；不是菜单里的合法值就回落到默认 5 分钟 */
+    {
+        int ms = (int)reg_get(L"IV", (DWORD)g_pollMs);
+        int ok = 0;
+        for (int k = 0; k < IV_COUNT; k++) {
+            if (kIntervals[k].ms == ms) {
+                ok = 1;
+                break;
+            }
+        }
+        g_pollMs = ok ? ms : 300000;
+    }
+    prov_set_poll_ms(g_pollMs);
+
     /* 先扫描：托盘图标的数量取决于设备数 */
     g_n = prov_scan();
     load_cache();
@@ -1470,7 +1523,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         }
     }
     g_lastScan = GetTickCount64();
-    g_nextPoll = g_lastScan + 3000;
+    g_nextPoll = g_lastScan + (ULONGLONG)g_pollMs;
 
 #ifdef BATT_SIM
     SetTimer(g_hwnd, 9, 1500, NULL);

@@ -101,6 +101,12 @@ static int    g_v90fail[PROV_MAX];
 /* 小鸡手柄心跳后仍读不到 0x12 报文的计数（同上，退避用） */
 static int    g_gsrFail[PROV_MAX];
 
+/* 主动查询间隔（毫秒）。协议层自己不用它，只写进诊断文件，
+   方便判断「图标多久没变」是设备睡了还是间隔设得太长。 */
+static int    g_pollMsHint;
+
+void prov_set_poll_ms(int ms) { g_pollMsHint = ms; }
+
 /* 诊断日志（跨设备共用一份，按扫描顺序追加） */
 static WCHAR g_log[16384];
 static int   g_logLen;
@@ -2083,8 +2089,9 @@ BOOL prov_diag(const WCHAR *path)
     len += wsprintfW(txt + len,
                      L"BattTray diagnostics\r\n"
                      L"version  : %s\r\n"
-                     L"devices  : %d\r\n\r\n",
-                     BATT_VERSION, g_ndev);
+                     L"devices  : %d\r\n"
+                     L"interval : %d s\r\n\r\n",
+                     BATT_VERSION, g_ndev, g_pollMsHint / 1000);
 
     for (int i = 0; i < g_ndev; i++) {
         DEVENT *d = &g_dev[i];

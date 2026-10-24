@@ -5,7 +5,7 @@
 #include <windows.h>
 
 #ifndef BATT_VERSION
-#define BATT_VERSION L"1.3.1"
+#define BATT_VERSION L"1.4.0"
 #endif
 
 #define PROV_MAX 6          /* 同时跟踪的设备上限 */
@@ -42,5 +42,7 @@ BOOL prov_poll(int i, READING *r);
 
 int  prov_last_raw(int i, BYTE *out, int cap); /* 最近一帧原始报文，返回字节数 */
 BOOL prov_diag(const WCHAR *path);             /* 导出诊断信息 */
+
+void prov_set_poll_ms(int ms);                 /* 仅用于诊断文件里注明查询间隔 */
 
 #endif
