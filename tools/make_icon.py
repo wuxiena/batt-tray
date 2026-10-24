@@ -1,70 +1,132 @@
-"""Generate app.ico (16/32/48 px) for BattTray - pure stdlib, no PIL."""
-import struct, os
+"""Generate src/res/app.ico (battery icon) - pure stdlib, no PIL.
 
-GREEN = (0x3C, 0xC8, 0x3C)  # R,G,B
+4x supersampled anti-aliasing; sizes 16/24/32/48/64 as BMP frames,
+256 as PNG frame.
+"""
+import struct, os, zlib
 
-
-def draw(size, level=88):
-    """Return list of rows (top-down) of (r,g,b,a)."""
-    px = [[(0, 0, 0, 0)] * size for _ in range(size)]
-    k = size / 32.0
-
-    def rect(x0, y0, x1, y1, col):
-        for y in range(int(y0 * k), int(y1 * k) + 1):
-            for x in range(int(x0 * k), int(x1 * k) + 1):
-                if 0 <= x < size and 0 <= y < size:
-                    px[y][x] = col
-
-    col = GREEN + (255,)
-    # body outline 2px
-    rect(3, 9, 25, 10.9, col)
-    rect(3, 21.1, 25, 23, col)
-    rect(3, 9, 4.9, 23, col)
-    rect(23.1, 9, 25, 23, col)
-    # nub
-    rect(26, 14, 28, 18, col)
-    # fill
-    w = 22 - 6
-    fill = int(w * level / 100.0)
-    rect(6, 12, 6 + fill, 20, col)
-    return px
+GREEN = (0x3C, 0xC8, 0x3C)
+DARK  = (0x2F, 0x34, 0x38)
+BODY  = (0xF7, 0xF9, 0xFA)
+SS = 4  # supersample factor
 
 
-def bmp_entry(px, size):
-    # BITMAPINFOHEADER: height doubled, bottom-up XOR bitmap + AND mask
-    hdr = struct.pack("<IiiHHIIiiII", 40, size, size * 2, 1, 32, 0, 0, 0, 0, 0, 0)
+def sample(px, py, level=88):
+    """Shape test at normalized coords (0..1). Returns (r,g,b,a)."""
+    bx0, by0, bx1, by1 = 0.09, 0.28, 0.79, 0.72   # battery body
+    nx0, nx1, ny0, ny1 = 0.79, 0.90, 0.42, 0.58   # nub
+    sw = 0.055                                     # stroke width
+    r = 0.055                                      # corner radius
+
+    def inside(x, y, x0, y0, x1, y1, rad):
+        if x < x0 or x > x1 or y < y0 or y > y1:
+            return False
+        dx = max(x0 + rad - x, 0.0, x - (x1 - rad))
+        dy = max(y0 + rad - y, 0.0, y - (y1 - rad))
+        return dx * dx + dy * dy <= rad * rad
+
+    body_o = inside(px, py, bx0, by0, bx1, by1, r)
+    body_i = inside(px, py, bx0 + sw, by0 + sw, bx1 - sw, by1 - sw, max(r - sw, 0.01))
+    nub = inside(px, py, nx0, ny0, nx1, ny1, 0.02)
+
+    if nub or (body_o and not body_i):
+        return DARK + (255,)
+    if body_i:
+        fx = bx0 + sw + (bx1 - bx0 - 2 * sw) * level / 100.0
+        if px <= fx:
+            return GREEN + (255,)
+        return BODY + (255,)
+    return (0, 0, 0, 0)
+
+
+def render(size, level):
+    img = bytearray(size * size * 4)
+    for j in range(size):
+        for i in range(size):
+            r = g = b = a = 0
+            for sj in range(SS):
+                for si in range(SS):
+                    pr, pg, pb, pa = sample((i + (si + 0.5) / SS) / size,
+                                            (j + (sj + 0.5) / SS) / size, level)
+                    r += pr * pa; g += pg * pa; b += pb * pa; a += pa
+            n = SS * SS
+            o = (j * size + i) * 4
+            if a > 0:
+                img[o]     = min(255, round(r / a))
+                img[o + 1] = min(255, round(g / a))
+                img[o + 2] = min(255, round(b / a))
+                img[o + 3] = min(255, round(a / n))
+    return img
+
+
+def bmp_frame(img, size):
+    """BITMAPINFOHEADER (height doubled) + bottom-up BGRA + all-zero AND mask."""
+    hdr = struct.pack('<IiiHHIIiiII', 40, size, size * 2, 1, 32, 0, 0, 0, 0, 0, 0)
     xor = bytearray()
     for y in range(size - 1, -1, -1):
+        row = img[y * size * 4:(y + 1) * size * 4]
         for x in range(size):
-            r, g, b, a = px[y][x]
-            xor += bytes((b, g, r, a))
-    row_bytes = ((size + 31) // 32) * 4
-    mask = bytearray()
-    for y in range(size - 1, -1, -1):
-        row = bytearray(row_bytes)
+            o = x * 4
+            xor += bytes((row[o + 2], row[o + 1], row[o], row[o + 3]))
+    mask = bytes(((size + 31) // 32) * 4 * size)   # alpha channel carries transparency
+    return hdr + bytes(xor) + mask
+
+
+def png_frame(img, size):
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)                              # filter: none
+        row = img[y * size * 4:(y + 1) * size * 4]
         for x in range(size):
-            if px[y][x][3] == 0:
-                row[x // 8] |= (0x80 >> (x % 8))
-        mask += row
-    return hdr + bytes(xor) + bytes(mask)
+            o = x * 4
+            raw += bytes((row[o + 2], row[o + 1], row[o], row[o + 3]))
+
+    def chunk(tag, data):
+        c = tag + data
+        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c))
+
+    ihdr = struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+            + chunk(b'IDAT', zlib.compress(bytes(raw), 9)) + chunk(b'IEND', b''))
 
 
 def main():
-    sizes = [16, 32, 48]
-    images = [bmp_entry(draw(s), s) for s in sizes]
-    out = bytearray()
-    out += struct.pack("<HHH", 0, 1, len(sizes))
-    offset = 6 + 16 * len(sizes)
-    for s, img in zip(sizes, images):
-        out += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(img), offset)
-        offset += len(img)
-    for img in images:
-        out += img
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico")
-    with open(path, "wb") as f:
-        f.write(out)
-    print("wrote", path, len(out), "bytes")
+    sizes = [16, 24, 32, 48, 64, 256]
+    frames = []
+    for s in sizes:
+        img = render(s, 88)
+        frames.append((s, png_frame(img, s) if s >= 256 else bmp_frame(img, s)))
+        print('  %4d px %7d B' % (s, len(frames[-1][1])))
+
+    ico = struct.pack('<HHH', 0, 1, len(frames))
+    off = 6 + 16 * len(frames)
+    entries = b''
+    for s, data in frames:
+        w = 0 if s >= 256 else s
+        entries += struct.pack('<BBBBHHII', w, w, 0, 0, 1, 32, len(data), off)
+        off += len(data)
+    ico += entries + b''.join(d for _, d in frames)
+
+    out = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        '..', 'src', 'res', 'app.ico'))
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, 'wb') as f:
+        f.write(ico)
+    print('wrote', out, len(ico), 'bytes')
+
+    # 同时生成 C 字节数组：exe 用它运行时建图标（zig rc 不可用，资源段链接被
+    # lld 忽略，见 tools/res2coff.py 的教训——数组方案零工具链依赖）
+    c = os.path.normpath(os.path.join(os.path.dirname(out), '..', 'app_icon.c'))
+    with open(c, 'w', encoding='ascii') as f:
+        f.write('/* generated by tools/make_icon.py - do not edit */\n')
+        f.write('/* BattTray app icon, battery, sizes 16/24/32/48/64/256 */\n')
+        f.write('const unsigned int kAppIcoLen = %d;\n' % len(ico))
+        f.write('const unsigned char kAppIco[] = {')
+        for i in range(0, len(ico), 20):
+            f.write('\n    ' + ','.join('%d' % b for b in ico[i:i+20]) + ',')
+        f.write('\n};\n')
+    print('wrote', c, len(ico), 'bytes of data')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

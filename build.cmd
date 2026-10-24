@@ -25,7 +25,7 @@ set "ZIG_LOCAL_CACHE_DIR=%~dp0.zigcache"
 if not exist "dist" mkdir "dist"
 
 "%ZIG%" cc -target x86_64-windows-gnu -O2 -s -Wl,--subsystem,windows ^
-    -o dist\BattTray.exe src\BattTray.c src\providers.c ^
+    -o dist\BattTray.exe src\BattTray.c src\providers.c src\app_icon.c ^
     -luser32 -lshell32 -lgdi32 -ladvapi32 -lhid -lsetupapi -lm
 if errorlevel 1 (
     echo BUILD FAILED
