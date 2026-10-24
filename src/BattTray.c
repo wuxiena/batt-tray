@@ -1,7 +1,7 @@
 // BattTray - 无线设备电量托盘工具（多品牌 · 多设备）
 // 依赖：纯 Win32 API，无运行时框架
 // 结构：providers.c 负责各协议族；本文件负责界面与消息循环
-// 界面：每台设备一个托盘图标（悬停显示品牌）；圆形浮窗显示当前选中设备
+// 界面：每台设备一个托盘图标（悬停显示品牌）
 //
 // 多设备说明：
 //   托盘图标 uID = TRAY_UID_BASE + 设备序号，回调 wParam 即 uID。
@@ -23,7 +23,6 @@
 #define MENU_DEV_BASE    100
 #define MENU_PROTO       20
 #define MENU_RAW         21
-#define MENU_FLOAT       2
 #define MENU_AUTORUN     3
 #define MENU_RESCAN      4
 #define MENU_EXIT        5
@@ -74,9 +73,6 @@ static int g_pollMs = 300000;    /* 默认 5 分钟，用户可在右键菜单�
 #define DIG_W            3      /* 点阵字宽（像素） */
 #define DIG_H            5      /* 点阵字高（像素） */
 
-#define FLOAT_DIA        62     /* 圆形浮窗逻辑直径 */
-#define SS               4      /* 超采样倍数（抗锯齿） */
-
 static const WCHAR kClass[] = L"BattTrayWnd";
 static const WCHAR kRegKey[] = L"Software\\BattTray";
 static const WCHAR kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -110,25 +106,16 @@ typedef struct {
 
 static HINSTANCE  g_inst;
 static HWND       g_hwnd;
-static HWND       g_float;
 static HANDLE     g_mutex;
 static SLOT       g_slot[PROV_MAX];
 static int        g_n;                 /* 当前设备数 */
 static int        g_trayOn[PROV_MAX];  /* 该设备当前是否占了托盘图标 */
-static int        g_sel;               /* 浮窗显示的设备序号 */
 static ULONGLONG  g_lastScan;
 static ULONGLONG  g_nextPoll;
 static ULONGLONG  g_lastFlush;         /* 上次把使用时长落盘的时刻 */
 static HIST       g_hist[HIST_MAX];
 static BOOL       g_orphanOn;          /* 一台设备都没有时留下的入口图标 */
 static HICON      g_orphanIcon;
-static HFONT      g_font;
-static BOOL       g_showFloat;
-static BOOL       g_dragging;
-static BOOL       g_dragMoved;
-static POINT      g_dragOfs;
-static int        g_dpi = 96;
-static int        g_dia = FLOAT_DIA;
 
 #define STAMP_UNIT 600000000ULL
 
@@ -143,7 +130,6 @@ static DWORD stamp_now(void)
     return (DWORD)(v / STAMP_UNIT);
 }
 
-static int scale(int v) { return MulDiv(v, g_dpi, 96); }
 static int clamp100(int v) { return v < 0 ? 0 : (v > 100 ? 100 : v); }
 
 /* ---------------- 注册表 ---------------- */
@@ -270,14 +256,6 @@ static DWORD rgb_mix(DWORD a, DWORD b, int t)
     int g = (((int)(a >> 8) & 0xFF) * (256 - t) + ((int)(b >> 8) & 0xFF) * t) >> 8;
     int bl = ((int)(a & 0xFF) * (256 - t) + (int)(b & 0xFF) * t) >> 8;
     return 0xFF000000u | ((DWORD)r << 16) | ((DWORD)g << 8) | (DWORD)bl;
-}
-
-static DWORD shade(DWORD c, int pct)
-{
-    int r = (int)((c >> 16) & 0xFF) * pct / 100;
-    int g = (int)((c >> 8) & 0xFF) * pct / 100;
-    int b = (int)(c & 0xFF) * pct / 100;
-    return 0xFF000000u | ((DWORD)r << 16) | ((DWORD)g << 8) | (DWORD)b;
 }
 
 static int icon_size(void)
@@ -529,8 +507,6 @@ static void tray_remove(int i)
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
-static void float_render(void);
-
 /* 所有设备都断开时留一个入口图标。否则托盘里一个图标都不剩，
    用户连「退出」「重新扫描」都点不到，只能去任务管理器。 */
 static void orphan_tip(WCHAR *out, int cap)
@@ -626,16 +602,6 @@ static int tray_list(int *out)
     return n;
 }
 
-/* 浮窗显示目标必须落在能显示电量的设备上 */
-static void ensure_sel(void)
-{
-    if (slot_on_tray(g_sel))
-        return;
-    int rl[PROV_MAX];
-    int rn = tray_list(rl);
-    g_sel = rn ? rl[0] : -1;
-}
-
 static void slot_update(int i)
 {
     if (!slot_alive(i))
@@ -650,8 +616,6 @@ static void slot_update(int i)
         tray_show(i, FALSE);
     if (old)
         DestroyIcon(old);
-    if (i == g_sel && g_float && IsWindowVisible(g_float))
-        float_render();
 }
 
 static void tray_sync(void)
@@ -773,7 +737,9 @@ static void notify_low(int i)
 static void notify_tip(const WCHAR *title, const WCHAR *body, DWORD flags)
 {
     /* 没有可显示设备时，气泡挂到「入口图标」上，否则提示会直接丢失 */
-    int i = slot_alive(g_sel) ? g_sel : -1;
+    int i = -1;
+    for (int k = 0; k < g_n; k++)
+        if (slot_alive(k)) { i = k; break; }
     NOTIFYICONDATAW nid;
     ZeroMemory(&nid, sizeof(nid));
     nid.cbSize = sizeof(nid);
@@ -808,247 +774,6 @@ static void set_level(int i, int level, int charging)
         tray_sync();
 }
 
-/* ---------------- 圆形浮窗 ---------------- */
-
-static void ring_dot(HDC dc, HBRUSH br, int cx, int cy, int rad)
-{
-    SelectObject(dc, br);
-    SelectObject(dc, GetStockObject(NULL_PEN));
-    Ellipse(dc, cx - rad, cy - rad, cx + rad + 1, cy + rad + 1);
-}
-
-static void float_render(void)
-{
-    if (!g_float)
-        return;
-
-    int d = g_dia;
-    int big = d * SS;
-    int c = big / 2;
-
-    int level = -1, charging = -1;
-    BOOL linked = FALSE;
-    ensure_sel();
-    if (g_sel >= 0 && g_sel < g_n) {
-        level = g_slot[g_sel].level;
-        charging = g_slot[g_sel].charging;
-        linked = g_slot[g_sel].linked;
-    }
-
-    HDC screen = GetDC(NULL);
-
-    BITMAPINFO bi;
-    ZeroMemory(&bi, sizeof(bi));
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = big;
-    bi.bmiHeader.biHeight = -big;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-
-    void *srcBits = NULL;
-    HBITMAP srcBmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &srcBits, NULL, 0);
-    if (!srcBmp || !srcBits) {
-        if (srcBmp)
-            DeleteObject(srcBmp);
-        ReleaseDC(NULL, screen);
-        return;
-    }
-    HDC mem = CreateCompatibleDC(screen);
-    HGDIOBJ oldBmp = SelectObject(mem, srcBmp);
-
-    /* 底色 */
-    RECT full = { 0, 0, big, big };
-    HBRUSH bgb = CreateSolidBrush(RGB(0x1A, 0x1C, 0x21));
-    FillRect(mem, &full, bgb);
-    DeleteObject(bgb);
-
-    DWORD acc = level_color(level);
-    if (!linked)
-        acc = shade(acc, 62);
-    COLORREF accent = RGB((BYTE)(acc & 0xFF), (BYTE)((acc >> 8) & 0xFF), (BYTE)((acc >> 16) & 0xFF));
-
-    int thickness = scale(5) * SS;
-    int dotRad = thickness / 2;
-    int ro = c - scale(2) * SS - dotRad;
-    int sweep = (level < 0) ? 0 : clamp100(level) * 360 / 100;
-
-    /* 轨道 */
-    HBRUSH track = CreateSolidBrush(linked ? RGB(0x2E, 0x31, 0x38) : RGB(0x26, 0x28, 0x2D));
-    for (int a = 0; a < 360; a += 3) {
-        double th = (a - 90.0) * 3.14159265358979 / 180.0;
-        ring_dot(mem, track, c + (int)(ro * cos(th)), c + (int)(ro * sin(th)), dotRad);
-    }
-    DeleteObject(track);
-
-    /* 进度弧：12 点起顺时针 */
-    if (sweep > 0) {
-        HBRUSH prog = CreateSolidBrush(accent);
-        for (int a = 0; a <= sweep; a += 3) {
-            double th = (a - 90.0) * 3.14159265358979 / 180.0;
-            ring_dot(mem, prog, c + (int)(ro * cos(th)), c + (int)(ro * sin(th)), dotRad);
-        }
-        /* 末端补一个点，保证小数值也能看到起笔 */
-        double th = (sweep - 90.0) * 3.14159265358979 / 180.0;
-        ring_dot(mem, prog, c + (int)(ro * cos(th)), c + (int)(ro * sin(th)), dotRad);
-        DeleteObject(prog);
-    }
-
-    /* 中心数字：多设备时上移一点，给底部的设备指示点腾位置 */
-    WCHAR txt[16];
-    if (level < 0)
-        lstrcpyW(txt, L"--");
-    else
-        wsprintfW(txt, L"%d", level);
-
-    /* 指示点只按「能显示电量」的设备画：读不到的那台没有托盘图标，
-       在浮窗里也没有轮换的意义，只在右键列表里说明。 */
-    int rl[PROV_MAX];
-    int rn = tray_list(rl);
-
-    int shift = (rn > 1) ? scale(7) * SS : 0;   /* 多设备时数字上移，留出指示点 */
-    SetBkMode(mem, TRANSPARENT);
-    SetTextColor(mem, accent);
-    HGDIOBJ oldFont = SelectObject(mem, g_font);
-    RECT tr = { 0, -shift, big, big - shift };
-    DrawTextW(mem, txt, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(mem, oldFont);
-
-    /* 多设备时在数字下方画一排指示点：亮的是当前显示的那台 */
-    if (rn > 1) {
-        int step = scale(7) * SS;
-        int rr   = scale(2) * SS;
-        int y    = c + shift + scale(6) * SS;
-        int x0   = c - (rn - 1) * step / 2;
-        for (int k = 0; k < rn; k++) {
-            HBRUSH b = CreateSolidBrush(rl[k] == g_sel ? accent : RGB(0x4A, 0x50, 0x5A));
-            SelectObject(mem, b);
-            SelectObject(mem, GetStockObject(NULL_PEN));
-            int cx = x0 + k * step;
-            Ellipse(mem, cx - rr, y - rr, cx + rr + 1, y + rr + 1);
-            DeleteObject(b);
-        }
-    }
-
-    /* ---- 降采样 + 圆形 alpha + 预乘 ---- */
-    BITMAPINFO bd;
-    ZeroMemory(&bd, sizeof(bd));
-    bd.bmiHeader = bi.bmiHeader;
-    bd.bmiHeader.biWidth = d;
-    bd.bmiHeader.biHeight = -d;
-
-    void *dstBits = NULL;
-    HBITMAP dstBmp = CreateDIBSection(screen, &bd, DIB_RGB_COLORS, &dstBits, NULL, 0);
-    if (dstBmp && dstBits) {
-        DWORD *s = (DWORD *)srcBits;
-        DWORD *o = (DWORD *)dstBits;
-        double rad = big / 2.0 - scale(2) * SS;    /* 圆盘半径（环外缘） */
-        double cx0 = big / 2.0, cy0 = big / 2.0;
-
-        for (int y = 0; y < d; y++) {
-            for (int x = 0; x < d; x++) {
-                int sr = 0, sg = 0, sb = 0;
-                double cov = 0.0;
-
-                for (int sy = 0; sy < SS; sy++) {
-                    for (int sx = 0; sx < SS; sx++) {
-                        int px = x * SS + sx, py = y * SS + sy;
-                        DWORD v = s[py * big + px];
-                        sb += (int)(v & 0xFF);
-                        sg += (int)((v >> 8) & 0xFF);
-                        sr += (int)((v >> 16) & 0xFF);
-
-                        double ddx = (px + 0.5) - cx0;
-                        double ddy = (py + 0.5) - cy0;
-                        double dist = sqrt(ddx * ddx + ddy * ddy);
-                        double t = rad - dist + 0.5;      /* 边缘软化 1 像素 */
-                        if (t < 0.0) t = 0.0;
-                        if (t > 1.0) t = 1.0;
-                        cov += t;
-                    }
-                }
-
-                int n = SS * SS;
-                int a = (int)(cov / n * 255.0 + 0.5);
-                if (a <= 0) {
-                    o[y * d + x] = 0;
-                    continue;
-                }
-                int r = sr / n, g = sg / n, b = sb / n;
-                r = r * a / 255;
-                g = g * a / 255;
-                b = b * a / 255;
-                o[y * d + x] = ((DWORD)a << 24) | ((DWORD)r << 16) | ((DWORD)g << 8) | (DWORD)b;
-            }
-        }
-
-        HDC dst = CreateCompatibleDC(screen);
-        HGDIOBJ od = SelectObject(dst, dstBmp);
-        BLENDFUNCTION bf;
-        bf.BlendOp = AC_SRC_OVER;
-        bf.BlendFlags = 0;
-        bf.SourceConstantAlpha = 255;
-        bf.AlphaFormat = AC_SRC_ALPHA;
-        SIZE sz;
-        sz.cx = d;
-        sz.cy = d;
-        POINT po = { 0, 0 };
-        UpdateLayeredWindow(g_float, screen, NULL, &sz, dst, &po, 0, &bf, ULW_ALPHA);
-        SelectObject(dst, od);
-        DeleteDC(dst);
-    }
-
-    if (dstBmp)
-        DeleteObject(dstBmp);
-    SelectObject(mem, oldBmp);
-    DeleteDC(mem);
-    DeleteObject(srcBmp);
-    ReleaseDC(NULL, screen);
-}
-
-static void float_place_default(void)
-{
-    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    SetWindowPos(g_float, HWND_TOPMOST, sw - g_dia - scale(30), sh - g_dia - scale(110),
-                 g_dia, g_dia, SWP_NOACTIVATE);
-}
-
-static void float_apply_visible(void)
-{
-    if (g_showFloat) {
-        ShowWindow(g_float, SW_SHOWNOACTIVATE);
-        SetWindowPos(g_float, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        float_render();
-    } else {
-        ShowWindow(g_float, SW_HIDE);
-    }
-}
-
-static void float_save_pos(void)
-{
-    RECT r;
-    if (GetWindowRect(g_float, &r)) {
-        reg_set(L"FloatX", (DWORD)r.left);
-        reg_set(L"FloatY", (DWORD)r.top);
-    }
-}
-
-static void float_restore_pos(void)
-{
-    DWORD fx = reg_get(L"FloatX", 0xFFFFFFFF), fy = reg_get(L"FloatY", 0xFFFFFFFF);
-    if (fx == 0xFFFFFFFF || fy == 0xFFFFFFFF) {
-        float_place_default();
-        return;
-    }
-    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    if ((int)fx > sw - scale(20) || (int)fy > sh - scale(10) || (int)fx < -scale(40)) {
-        float_place_default();
-        return;
-    }
-    SetWindowPos(g_float, HWND_TOPMOST, (int)fx, (int)fy, g_dia, g_dia, SWP_NOACTIVATE);
-}
-
 /* ---------------- 菜单 ---------------- */
 
 static void append_usage(const WCHAR *path);   /* 定义在使用时长那一段 */
@@ -1079,10 +804,8 @@ static void fill_stats_menu(HMENU s);   /* 定义在使用时长那一段 */
 
 static void show_menu(int i)
 {
-    /* i 只是「从哪个图标点出来的」，菜单内容按当前状态整体重排，
-       所以这里只需要保证拿到的序号是有效设备（或 -1）。 */
-    if (!slot_alive(i))
-        i = slot_alive(g_sel) ? g_sel : -1;
+    /* 菜单内容按当前状态整体重排，与从哪个图标点出来无关 */
+    (void)i;
 
     HMENU m = CreatePopupMenu();
     WCHAR t[200];
@@ -1090,40 +813,25 @@ static void show_menu(int i)
     if (visible_count() == 0) {
         AppendMenuW(m, MF_STRING | MF_GRAYED, MENU_DEV_BASE, L"未检测到已连接的设备");
     } else {
-        /* 设备列表：每台一行，勾选的是浮窗正在显示的那台。
-           读不到电量的设备也列在这里（不进托盘），并标注原因。
+        /* 设备列表：每台一行，纯展示当前电量（灰色不可点）。
            已经断开的不列——它转到「使用统计」里作为历史记录出现。 */
         for (int k = 0; k < g_n; k++) {
             DEVDESC d;
             if (!slot_alive(k) || !dev_info(k, &d))
                 continue;
             const SLOT *s = &g_slot[k];
-            UINT flags = MF_STRING;
-            if (s->level < 0) {
-                flags |= MF_GRAYED;          /* 没电量可选，只做说明 */
-                /* 只按「谁不提供」区分：dongle 不回话 ≠ 手柄不报电量。
-                   别写「有线连接」——第三方 XInput dongle 无线也报有线。 */
-                const WCHAR *why = L"电量不可读";
-                if (text_has(d.detail, L"无应答"))
-                    why = L"电量不可读（dongle 不提供）";
-                else if (text_has(d.type, L"手柄"))
-                    why = L"电量不可读（手柄不提供）";
-                wsprintfW(t, L"%s %s · %s", d.brand, d.type, why);
-            } else {
-                if (k == g_sel)
-                    flags |= MF_CHECKED;
-                if (s->charging == 1)
-                    wsprintfW(t, L"%s %s · %d%%（充电中）", d.brand, d.type, s->level);
-                else
-                    wsprintfW(t, L"%s %s · %d%%%s", d.brand, d.type, s->level,
-                              s->linked ? L"" : L"（缓存）");
-            }
-            AppendMenuW(m, flags, MENU_DEV_BASE + k, t);
+            if (s->level < 0)
+                continue;               /* 读不到电量的不列（协议层已过滤，兜底） */
+            if (s->charging == 1)
+                wsprintfW(t, L"%s %s · %d%%（充电中）", d.brand, d.type, s->level);
+            else
+                wsprintfW(t, L"%s %s · %d%%%s", d.brand, d.type, s->level,
+                          s->linked ? L"" : L"（缓存）");
+            AppendMenuW(m, MF_STRING | MF_GRAYED, MENU_DEV_BASE + k, t);
         }
     }
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | (g_showFloat ? MF_CHECKED : 0), MENU_FLOAT, L"桌面浮窗");
     AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0), MENU_AUTORUN,
                 L"开机自动启动");
 
@@ -1498,10 +1206,7 @@ static void slot_mark_dead(int i)
         s->icon = NULL;
     }
 
-    ensure_sel();
     tray_sync();
-    if (g_float && IsWindowVisible(g_float))
-        float_render();
 }
 
 static void apply_reading(int i, const READING *r)
@@ -1615,11 +1320,6 @@ static void do_scan(void)
 
     rebuild_slots(prevN, prev, prevKey);
 
-    if (g_n > 0 && g_sel >= g_n)
-        g_sel = 0;
-    if (g_n == 0)
-        g_sel = 0;
-
     tray_sync_promote();
 
     /* 首次读数：被动型挂起监听，其余立即查一次 */
@@ -1641,9 +1341,6 @@ static void do_scan(void)
     for (int i = 0; i < g_n; i++)
         if (!g_slot[i].linked)
             g_slot[i].lastTick = g_lastScan;
-
-    if (g_float && IsWindowVisible(g_float))
-        float_render();
 }
 
 static void poll_all(void)
@@ -1784,84 +1481,6 @@ static void tick(void)
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (hwnd == g_float) {
-        switch (msg) {
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            BeginPaint(hwnd, &ps);
-            EndPaint(hwnd, &ps);
-            return 0;
-        }
-        case WM_ERASEBKGND:
-            return 1;
-        case WM_NCHITTEST: {
-            /* 圆形以外的区域让点击穿透 */
-            POINT p;
-            p.x = (short)LOWORD(lp);
-            p.y = (short)HIWORD(lp);
-            ScreenToClient(hwnd, &p);
-            int r = g_dia / 2;
-            int dx = p.x - r, dy = p.y - r;
-            if (dx * dx + dy * dy > r * r)
-                return HTTRANSPARENT;
-            return HTCLIENT;
-        }
-        case WM_LBUTTONDOWN:
-            g_dragging = TRUE;
-            g_dragMoved = FALSE;
-            SetCapture(hwnd);
-            {
-                POINT p;
-                GetCursorPos(&p);
-                g_dragOfs = p;
-            }
-            return 0;
-        case WM_MOUSEMOVE:
-            if (g_dragging) {
-                POINT p;
-                RECT r;
-                GetCursorPos(&p);
-                if (p.x != g_dragOfs.x || p.y != g_dragOfs.y)
-                    g_dragMoved = TRUE;
-                GetWindowRect(hwnd, &r);
-                SetWindowPos(hwnd, HWND_TOPMOST,
-                             r.left + (p.x - g_dragOfs.x),
-                             r.top + (p.y - g_dragOfs.y),
-                             0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-                g_dragOfs = p;
-            }
-            return 0;
-        case WM_LBUTTONUP:
-            if (g_dragging) {
-                g_dragging = FALSE;
-                ReleaseCapture();
-                if (g_dragMoved) {
-                    float_save_pos();
-                } else {
-                    /* 没拖动 = 点一下：在占托盘的设备之间轮换 */
-                    int rl[PROV_MAX];
-                    int rn = tray_list(rl);
-                    if (rn > 1) {
-                        int pos = 0;
-                        for (int k = 0; k < rn; k++)
-                            if (rl[k] == g_sel)
-                                pos = k;
-                        g_sel = rl[(pos + 1) % rn];
-                        float_render();
-                    }
-                }
-            }
-            return 0;
-        case WM_RBUTTONUP:
-        case WM_CONTEXTMENU:
-            show_menu(-1);
-            return 0;
-        default:
-            break;
-        }
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-
     switch (msg) {
 #ifdef BATT_SIM
     case WM_TIMER:
@@ -1885,14 +1504,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         switch (LOWORD((DWORD)lp)) {
         case WM_LBUTTONUP:
-            g_sel = i;
-            g_showFloat = !g_showFloat;
-            reg_set(L"Float", g_showFloat ? 1 : 0);
-            float_apply_visible();
-            break;
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU:
-            g_sel = i;
             show_menu(i);
             break;
         }
@@ -1901,18 +1514,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_COMMAND: {
         int id = LOWORD((DWORD)wp);
-        if (id >= MENU_DEV_BASE && id < MENU_DEV_BASE + PROV_MAX) {
-            int k = id - MENU_DEV_BASE;
-            if (k < g_n) {
-                g_sel = k;
-                if (!g_showFloat) {
-                    g_showFloat = TRUE;
-                    reg_set(L"Float", 1);
-                }
-                float_apply_visible();
-            }
-            return 0;
-        }
         if (id >= MENU_IV_BASE && id < MENU_IV_BASE + IV_COUNT) {
             g_pollMs = kIntervals[id - MENU_IV_BASE].ms;
             reg_set(L"IV", (DWORD)g_pollMs);
@@ -1921,11 +1522,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         switch (id) {
-        case MENU_FLOAT:
-            g_showFloat = !g_showFloat;
-            reg_set(L"Float", g_showFloat ? 1 : 0);
-            float_apply_visible();
-            break;
         case MENU_AUTORUN:
             autostart_apply(autostart_enabled() ? FALSE : TRUE);
             break;
@@ -2058,7 +1654,7 @@ static void save_cache_names(void)
 }
 
 /* 重置所有信息：清空历史/使用时长、电量缓存，并把当前所有设备按离线处理
-   后重新扫描。设置类（浮窗开关、刷新间隔、开机自启）保留不动。 */
+   后重新扫描。设置类（刷新间隔、开机自启）保留不动。 */
 static void reset_all(void)
 {
     ZeroMemory(g_hist, sizeof(g_hist));
@@ -2074,7 +1670,6 @@ static void reset_all(void)
         if (!g_slot[i].dead)
             slot_mark_dead(i);
     }
-    ensure_sel();
     tray_sync();
     do_scan();
     notify_tip(L"已重置所有信息", L"历史记录与电量缓存已清空。", NIIF_INFO);
@@ -2132,14 +1727,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         return 0;
 
     SetProcessDPIAware();
-    {
-        HDC sdc = GetDC(NULL);
-        g_dpi = GetDeviceCaps(sdc, LOGPIXELSX);
-        ReleaseDC(NULL, sdc);
-    }
-    if (g_dpi < 96)
-        g_dpi = 96;
-    g_dia = scale(FLOAT_DIA);
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -2157,21 +1744,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     if (!g_hwnd)
         return 1;
 
-    g_showFloat = reg_get(L"Float", 1) ? TRUE : FALSE;
     for (int i = 0; i < PROV_MAX; i++) {
         g_slot[i].level = -1;
         g_slot[i].charging = -1;
     }
-
-    g_float = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                              kClass, L"BattTrayFloat", WS_POPUP,
-                              0, 0, g_dia, g_dia, NULL, NULL, inst, NULL);
-
-    g_font = CreateFontW(-(int)(scale(23) * SS), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                         ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    if (!g_font)
-        g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
     /* 刷新间隔：读注册表；不是菜单里的合法值就回落到默认 5 分钟 */
     {
@@ -2200,9 +1776,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         g_slot[i].lastTick = GetTickCount64();
     }
     tray_sync_promote();
-
-    float_restore_pos();
-    float_apply_visible();
 
     for (int i = 0; i < g_n; i++) {
         if (prov_is_passive(i)) {
@@ -2288,8 +1861,6 @@ done:
         if (g_slot[i].icon)
             DestroyIcon(g_slot[i].icon);
     }
-    if (g_font)
-        DeleteObject(g_font);
     if (g_mutex)
         CloseHandle(g_mutex);
     return 0;
