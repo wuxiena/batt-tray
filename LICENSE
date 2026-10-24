@@ -1,6 +1,13 @@
 MIT License
 
-Copyright (c) 2026 RapooBattery contributors
+Copyright (c) 2026 wuxiena
+
+Portions of this software — specifically the Rapoo battery protocol constants
+(7-byte input report, leading byte 0xBB, battery percentage in the last byte)
+and the HID vendor-collection selection criteria — are derived from
+JD13703202/rapoo-vt3-battery (https://github.com/JD13703202/rapoo-vt3-battery),
+Copyright (c) 2025 RapooVT3Battery Contributors, which is also distributed
+under the MIT License. No source code was copied from that project.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

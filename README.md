@@ -22,7 +22,7 @@ Rapoo 的 2.4G 接收器不会被 Windows 登记为电池设备，系统设置�
 
 ## 使用
 
-1. 直接运行 `dist/RapooBattery.exe`（源码仓库内置了预编译版本；自行编译见下文）。
+1. 从 [Releases](../../releases/latest) 下载 `RapooBattery.exe` 直接运行（或使用仓库内的 `dist/RapooBattery.exe`，两者一致）。
 2. 托盘出现电池图标，悬停显示 `雷柏无线鼠标  电量 93%`。
 3. 桌面右下角有一个黑底大号百分比的**浮窗**，可拖动，位置会记住。
 4. **左键单击**托盘图标 = 显示 / 隐藏浮窗。
@@ -83,6 +83,24 @@ build.cmd
 若你的型号协议不同，用 `tools/probe/` 下的脚本重新抓一帧即可：解析逻辑集中在 `src/RapooBattery.c`
 的 `handle_report()`，改一行就能适配。
 
+## 参考与致谢
+
+- **[JD13703202/rapoo-vt3-battery](https://github.com/JD13703202/rapoo-vt3-battery)**（MIT）
+
+  本项目据此确认了雷柏鼠标的电量协议：7 字节输入报告、首字节 `0xBB`、**末字节为电量百分比**，
+  以及 `UsagePage 0xFF00` 厂商集合的定位方式。该结论是本文档「原理」一节的基础。
+
+  说明范围：只借用了**协议帧格式与集合筛选条件**这类事实性信息，没有复制其源码；
+  本项目的 HID 读写、重叠 I/O 常驻监听、托盘/浮窗绘制均为独立实现。
+  原始报文由本仓库 `tools/probe/` 下的脚本在实机上抓取验证（`BB B0 02 72 06 01 5D`）。
+
+### 许可证选择
+
+参考项目采用 **MIT**，与本项目一致，因此本项目继续使用 MIT：
+
+- 两者兼容，无 copyleft（传染性）要求，可自由用于闭源或商业场景；
+- 按 MIT 条款，在 [LICENSE](LICENSE) 中保留了参考项目的版权声明。
+
 ## 目录结构
 
 ```
@@ -114,3 +132,8 @@ tools/                   调试与逆向辅助
 ## License
 
 [MIT](LICENSE)
+
+Copyright (c) 2026 wuxiena
+
+协议常量部分衍生自 [JD13703202/rapoo-vt3-battery](https://github.com/JD13703202/rapoo-vt3-battery)，
+Copyright (c) 2025 RapooVT3Battery Contributors，同样以 MIT 授权。
