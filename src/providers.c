@@ -274,6 +274,56 @@ static const WCHAR *brand_name(USHORT vid, USHORT pid)
     return NULL;
 }
 
+/* 小鸡 GameSir 厂商接口（VID 0x3537）的 PID → 型号。数据整理自开源逆向项目
+   broroeror/gamesir-linux-tools 的型号表与 PCGamingWiki。
+   同一型号不同固件/版本会换 PID，个别 PID 被多个型号共用，这种情况写成
+   「A / B」；认不出来就退回通用名字，不猜。 */
+static const WCHAR *gamesir_model(USHORT pid)
+{
+    switch (pid) {
+    /* Cyclone 2 */
+    case 0x100B: case 0x1053:
+        return L"小鸡 Cyclone 2";
+    case 0x0575:                   /* Cyclone 2 extras 模式 / G7 Pro XUSB 共用 */
+        return L"小鸡 Cyclone 2 / G7 Pro";
+
+    /* G7 系列 */
+    case 0x1001: return L"小鸡 G7";
+    case 0x1065: return L"小鸡 G7 HE";
+    case 0x1010: case 0x0630: case 0x1069: case 0x10A0:
+        return L"小鸡 G7 SE";
+
+    /* G7 Pro（含各联名版） */
+    case 0x109B: case 0x109C:       /* Shadow Ember 有线 / 接收器 */
+    case 0x10BA: case 0x10BB:       /* Amazon 版 */
+    case 0x1003: case 0x1004:       /* White Trimode */
+    case 0x10A7:                    /* Wuchang */
+    case 0x1022: case 0x100A:       /* GIP 原生 / 切换态 */
+        return L"小鸡 G7 Pro";
+
+    /* G7 Pro 8K PC（含联名版） */
+    case 0x10B8:
+    case 0x10C5: case 0x10C6:       /* Aimlabs */
+    case 0x10C7: case 0x10C8:       /* Nioh */
+    case 0x1032: case 0x1033:       /* Royal2 */
+    case 0x10B7: case 0x10B9:       /* Championship */
+        return L"小鸡 G7 Pro 8K PC";
+
+    /* Tarantula Pro 8K */
+    case 0x103D: case 0x103C:
+        return L"小鸡 Tarantula Pro 8K";
+
+    /* Kaleid（0x1082 与 G7 SE 的 HID 身份共用） */
+    case 0x1012: case 0x1086:
+        return L"小鸡 Kaleid";
+    case 0x1082:
+        return L"小鸡 G7 SE / Kaleid";
+
+    default:
+        return L"小鸡 GameSir";
+    }
+}
+
 /* 读 HID 产品名（零权限句柄即可）。返回 FALSE 表示拿不到。 */
 static BOOL hid_product_string(const WCHAR *path, WCHAR *out, int cap)
 {
@@ -944,21 +994,67 @@ static BOOL vend90_query_co(HANDLE h, int outLen, int inLen, READING *r)
     return FALSE;
 }
 
-/* ---------------- 协议族：小鸡 GameSir（0x3537 厂商接口） ---------------- */
+/* ---------------- 协议族：小鸡 GameSir（VID 0x3537 厂商接口） ---------------- */
 //
 // 小鸡手柄在 PC 上有两套身份：
 //     0x2F24 —— XInput / GIP 身份，Windows 里就是一支普通 Xbox 手柄；
-//     0x3537 —— 厂商接口，电量只走这里。
-// 厂商接口的读法来自开源逆向项目 broroeror/gamesir-linux-tools（Cyclone 2 /
-// G7 Pro / G7 SE / Tarantula 实测）：先发一条 0x0F 报文做心跳，手柄才会持续
-// 推送 0x12 状态报文；报文第 36 字节就是电量百分比，第 35 字节 bit0 是充电。
-// 心跳不发，通道完全是哑的——这一点和「先听再说」的耳机 dongle 不同。
+//     0x3537 —— 厂商接口，电量只走这里（HID 厂商页 0xFF00 及以上）。
+// 厂商接口读法来自开源逆向项目 broroeror/gamesir-linux-tools：
+//     0x0F 0xF2 是心跳；0x12 增强报文第 36 字节 = 电量 0..100，
+//     第 35 字节 bit0 = 充电 / 接线。
+//
+// 确认走 0x12 通道的型号：Cyclone 2、G7 Pro 8K PC、Tarantula Pro 8K（PC 模式）。
+// 下面这几类在 Windows 上读不到，不要再找：
+//   · G7 Pro（非 8K）有线 / 接收器的电量在「厂商类 USB」接口的 0x10 报文里，
+//     不是 HID，要 WinUSB 抢驱动，普通程序拿不到；
+//   · G7 SE / Kaleid 走 GIP，电量在 Xbox 驱动侧；
+//   · 老款 T4 Pro / G4 Pro 只有 LED 档位指示，USB 上根本没有数字电量。
+//
+// 两个坑：
+//   1) 非 Xbox 模式或手柄睡着时，0x12 会整包全 0，不能当 0% 用；
+//   2) 有线时可能同时暴露两个厂商接口，一个只推空 0x12，要挑有数据的那个。
 //
 // ⚠️ 本分支尚未在实机上验证（写这段时手上没有小鸡手柄）。解析只认 0x12 报文
-// 头且电量限定 0..100，认不出来就当作「不可读」，不会编数字。
+// 头、电量限定 0..100，且要求整帧不是全 0，认不出来就当作「不可读」。
+
+/* 整帧全 0 ＝ 不在 Xbox 模式 / 手柄睡着，不是真的 0%。 */
+static BOOL gamesir_frame_alive(const BYTE *rx, DWORD got)
+{
+    if (got < 37 || rx[0] != 0x12)
+        return FALSE;
+    for (DWORD i = 1; i < got; i++) {
+        if (rx[i])
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL gamesir_parse(const BYTE *rx, DWORD got, READING *r)
+{
+    if (!gamesir_frame_alive(rx, got))
+        return FALSE;
+    int lv = rx[36];
+    if (lv < 0 || lv > 100)
+        return FALSE;
+    r->level = lv;
+    r->charging = (rx[35] & 0x01) ? 1 : 0;
+    r->valid = TRUE;
+    return TRUE;
+}
 
 static BOOL gamesir_read_co(HANDLE h, int outLen, int inLen, READING *r)
 {
+    int rd = (inLen >= 37 && inLen <= 64) ? inLen : 64;
+    BYTE rx[64];
+    DWORD got = 0;
+
+    /* 1) 很多固件的 0x12 是常推的，先静听：写不进去的接口也能用，
+          也能跳过「只推空 0x12」的那个接口。 */
+    ZeroMemory(rx, sizeof(rx));
+    if (io_read(h, rx, (DWORD)rd, &got, 100) && gamesir_parse(rx, got, r))
+        return TRUE;
+
+    /* 2) 有的固件要心跳 0F F2 才开口。 */
     BYTE tx[64];
     int  n = (outLen >= 4 && outLen <= (int)sizeof(tx)) ? outLen : 64;
 
@@ -968,22 +1064,13 @@ static BOOL gamesir_read_co(HANDLE h, int outLen, int inLen, READING *r)
     if (!io_write(h, tx, (DWORD)n, 200))
         return FALSE;
 
-    int rd = (inLen >= 37 && inLen <= (int)sizeof(tx)) ? inLen : 64;
     for (int tries = 0; tries < 3; tries++) {
-        BYTE  rx[64];
-        DWORD got = 0;
+        got = 0;
         ZeroMemory(rx, sizeof(rx));
         if (!io_read(h, rx, (DWORD)rd, &got, 90))
             return FALSE;         /* 超时：报文没来（手柄没连 / 不在 Xbox 模式） */
-        if (got < 37 || rx[0] != 0x12)
-            continue;             /* 别的报文，继续等 */
-        int lv = rx[36];
-        if (lv < 0 || lv > 100)
-            continue;
-        r->level = lv;
-        r->charging = (rx[35] & 0x01) ? 1 : 0;
-        r->valid = TRUE;
-        return TRUE;
+        if (gamesir_parse(rx, got, r))
+            return TRUE;
     }
     return FALSE;
 }
@@ -1466,14 +1553,16 @@ static BOOL match_group(COLL *col, int *idx, int gn, BYTE mask, DEVENT *d)
             if (gamesir_read_co(h, c->outLen, c->inLen, &r) && r.valid) {
                 WCHAR det[144];
                 const WCHAR *tp = (lstrcmpW(type, L"设备") == 0) ? L"手柄" : type;
-                wsprintfW(det, L"GameSir · 0x12 状态报文 · %u 字节", c->inLen);
-                fill_common(d, c, K_GAMESIR, brand_name(c->vid, c->pid), tp, det);
+                wsprintfW(det, L"GameSir · 0x12 状态报文 · %u 字节 · PID %04X",
+                          c->inLen, c->pid);
+                fill_common(d, c, K_GAMESIR, gamesir_model(c->pid), tp, det);
                 d->h = h;
                 d->outLen = c->outLen;
                 d->inLen = c->inLen;
                 d->featLen = c->featLen;
                 d->lastLevel = r.level;
-                logf(L"match GAMESIR level=%d charging=%d", r.level, r.charging);
+                logf(L"match GAMESIR pid=%04X level=%d charging=%d",
+                     c->pid, r.level, r.charging);
                 return TRUE;
             }
             CloseHandle(h);
@@ -1484,8 +1573,9 @@ static BOOL match_group(COLL *col, int *idx, int gn, BYTE mask, DEVENT *d)
             if (h != INVALID_HANDLE_VALUE) {
                 WCHAR det[144];
                 const WCHAR *tp = (lstrcmpW(type, L"设备") == 0) ? L"手柄" : type;
-                wsprintfW(det, L"GameSir · 0x12 状态报文 · %u 字节 · 无应答", c->inLen);
-                fill_common(d, c, K_GAMESIR, brand_name(c->vid, c->pid), tp, det);
+                wsprintfW(det, L"GameSir · 0x12 状态报文 · %u 字节 · 无应答 · PID %04X",
+                          c->inLen, c->pid);
+                fill_common(d, c, K_GAMESIR, gamesir_model(c->pid), tp, det);
                 d->h = h;
                 d->outLen = c->outLen;
                 d->inLen = c->inLen;
@@ -2049,8 +2139,9 @@ BOOL prov_poll(int i, READING *r)
         if (ok && r->valid) {
             g_gsrFail[i] = 0;
             if (w_contains(d->detail, L"无应答")) {
-                wsprintfW(d->detail, L"GameSir · 0x12 状态报文 · %d 字节", d->inLen);
-                logf(L"GAMESIR starts answering, level=%d", r->level);
+                wsprintfW(d->detail, L"GameSir · 0x12 状态报文 · %d 字节 · PID %04X",
+                          d->inLen, d->pid);
+                logf(L"GAMESIR starts answering, pid=%04X level=%d", d->pid, r->level);
             }
         } else {
             g_gsrFail[i]++;

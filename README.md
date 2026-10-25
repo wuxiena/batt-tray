@@ -63,7 +63,7 @@
 | ATK / VXE / VGN / 达尔优 等 Compx 方案 | 短/长报告查询 | ⚠️ 同上 |
 | LEOBOG / 迈从 MCHOSE（Realtek 方案） | 厂商命令查询 | ⚠️ 同上 |
 | 飞智 Flydigi | FFA0 厂商查询 | ⚠️ 同上 |
-| 小鸡 GameSir（Cyclone / G7 / Tarantula 等） | `3537` 厂商接口心跳 + 状态报文 | ⚠️ 按开源逆向实现 |
+| 小鸡 GameSir（Cyclone 2 / G7 Pro 8K PC / Tarantula Pro 8K） | `3537` 厂商接口 `0x12` 状态报文（第 36 字节电量、第 35 字节 bit0 充电） | ⚠️ 按开源逆向实现，未实机 |
 | 索尼 DualShock 4 / DualSense | 输入报文电量字段 | ⚠️ 按公开资料实现 |
 | Xbox 及 XInput 兼容手柄 | 系统 API（4 档粗粒度） | ✅ 通用回退 |
 | 蓝牙耳机（AirPods、索尼 WH/WF 等） | Windows 电池类接口 | ✅ 通用回退 |
@@ -71,6 +71,10 @@
 - ⚠️ 项未在本机实机验证，按「尽力兼容」处理：解析失败不会显示可疑数字，只会回退到
   Windows 电池接口或标为「不可读」。
 - 读不到电量的设备完全不显示，电量请看设备自身的指示灯或官方 App。
+- 小鸡 GameSir 只有部分型号在 Windows 上能读到电量：Cyclone 2、G7 Pro 8K PC、
+  Tarantula Pro 8K 走 HID 厂商接口；G7 Pro（非 8K）有线 / 接收器走厂商类 USB、
+  G7 SE / Kaleid 走 GIP、老款 T4 Pro / G4 Pro 只有 LED 档位指示，这几类读不到，
+  所以不显示。手柄需切到 **Xbox 模式**才会推电量报文。
 
 ## 常见问题
 
