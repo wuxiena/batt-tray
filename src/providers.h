@@ -5,7 +5,7 @@
 #include <windows.h>
 
 #ifndef BATT_VERSION
-#define BATT_VERSION L"1.1.2"
+#define BATT_VERSION L"1.1.3"
 #endif
 
 #define PROV_MAX 6          /* 同时跟踪的设备上限 */
