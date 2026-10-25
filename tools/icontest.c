@@ -14,6 +14,7 @@
 #undef WinMain
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #define CELL   16
 #define GAP    6
@@ -90,15 +91,33 @@ static void write_bmp(const char *path, const DWORD *px, int w, int h)
     fclose(f);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    static const int levels[5] = { 92, 45, 8, 100, -1 };
+    static const int def[5] = { 92, 45, 8, 100, -1 };
+    int levels[12];
+    int N = 5;
+
+    /* 可选：按命令行给的电量渲染，例如 icontest.exe 78 60 35 100 */
+    if (argc > 1) {
+        N = 0;
+        for (int i = 1; i < argc && N < 12; i++)
+            levels[N++] = atoi(argv[i]);
+        if (N == 0) {
+            N = 5;
+            for (int i = 0; i < 5; i++)
+                levels[i] = def[i];
+        }
+    } else {
+        for (int i = 0; i < 5; i++)
+            levels[i] = def[i];
+    }
+
     /* 三行：浅色任务栏 / 深色任务栏 / 缓存读数（未连接） */
     static const DWORD bgs[3]   = { 0xFFF3F3F3u, 0xFF202020u, 0xFFF3F3F3u };
     static const int   dims[3]  = { 0, 0, 1 };
     const int ROWS = 3;
 
-    const int W = MARGIN * 2 + 5 * CELL + 4 * GAP;
+    const int W = MARGIN * 2 + N * CELL + (N - 1) * GAP;
     const int H = MARGIN * 2 + ROWS * CELL + (ROWS - 1) * GAP;
 
     DWORD *sheet = (DWORD *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -113,7 +132,7 @@ int main(void)
 
     DWORD px[ICON_MAX * ICON_MAX];
     for (int row = 0; row < ROWS; row++) {
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < N; i++) {
             HICON ic = build_icon(levels[i], dims[row]);
             if (!ic)
                 continue;

@@ -19,6 +19,7 @@
 /*_dbg.exe
 /*_sim.exe
 /shots/
+/shots_multi/
 /*.png
 dist/*-diag.txt
 diag.txt
