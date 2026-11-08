@@ -35,6 +35,9 @@
 #define MENU_RESET      12       /* 重置所有信息 */
 #define MENU_UNINSTALL  13       /* 卸载并清除所有数据 */
 #define MENU_HIST_BASE  300      /* 统计条目（灰色，仅展示）：300 .. 300+HIST_MAX-1 */
+#define MENU_LOW_ONOFF  398      /* 低电量提醒开关 */
+#define MENU_LOW_TEST   399      /* 手动弹一条测试气泡 */
+#define MENU_LOW_BASE   400      /* 提醒阈值：400 .. 400+LOW_COUNT-1 */
 
 /* 离线判定。无线设备关机后接收器还在枚举，所以只能靠「还有没有回应」判断：
    - 被动上报型（雷柏、索尼）：不再推帧就是走了，3 分钟足够排除偶发丢包；
@@ -64,6 +67,15 @@ static const struct { int ms; const WCHAR *label; } kIntervals[] = {
 
 static int g_pollMs = 300000;    /* 默认 5 分钟，用户可在右键菜单里改 */
 
+/* 低电量提醒：阈值可选，默认 20%。滞回 5% 防止在阈值附近反复弹气泡。
+   开关与阈值存 HKCU\Software\BattTray 的 LO / LT，菜单里随时可改。 */
+#define LOW_HYST 5
+static const int kLowLevels[] = { 10, 15, 20, 30 };
+#define LOW_COUNT ((int)(sizeof(kLowLevels) / sizeof(kLowLevels[0])))
+
+static BOOL g_lowEnabled = TRUE; /* 是否弹低电量气泡 */
+static int  g_lowLevel   = 20;   /* 低于或等于该百分比时提醒 */
+
 #define TRAY_UID_BASE    100        /* 托盘图标 uID 起点 */
 #define TRAY_UID_ORPHAN  (TRAY_UID_BASE + PROV_MAX)  /* 一台设备都没有时的入口图标 */
 
@@ -91,6 +103,7 @@ typedef struct {
     int       cachedMin;   /* 启动时从注册表恢复的读数「多少分钟前」 */
     HICON     icon;
     BOOL      lowNotified;
+    int       zeroStreak;  /* 连续读到 0% 的次数：单帧 0% 常是空帧误报，不立刻提醒 */
     int       fail;        /* 连续查询失败次数：避免一次偶发失败就把图标变暗 */
     BOOL      dead;        /* 判定已断开：不占托盘、不进列表、停止计时 */
     int       probe;       /* 疑似离线后的复查次数 */
@@ -741,11 +754,17 @@ static void tray_sync_promote(void)
     }
 }
 
-static void notify_low(int i)
+/* 返回气泡是否成功提交给外壳；失败时调用方不要置 lowNotified，下次读数会重试。
+   level 必须传本次读数：以前直接读 g_slot[i].level，set_level 还没更新它，
+   气泡里显示的是上一帧（首次读数是注册表缓存值，离线复活时甚至是 -1）。 */
+static BOOL notify_low(int i, int level)
 {
     DEVDESC d;
     if (!dev_info(i, &d))
-        return;
+        return FALSE;
+    /* 气泡必须挂在已注册的托盘图标上，否则 NIM_MODIFY 会直接失败 */
+    if (!g_trayOn[i])
+        tray_sync();
     NOTIFYICONDATAW nid;
     ZeroMemory(&nid, sizeof(nid));
     nid.cbSize = sizeof(nid);
@@ -754,8 +773,8 @@ static void notify_low(int i)
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_WARNING;
     wsprintfW(nid.szInfoTitle, L"%s %s 电量低", d.brand, d.type);
-    wsprintfW(nid.szInfo, L"剩余 %d%%，建议充电。", g_slot[i].level);
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    wsprintfW(nid.szInfo, L"剩余 %d%%，建议充电。", level);
+    return Shell_NotifyIconW(NIM_MODIFY, &nid) ? TRUE : FALSE;
 }
 
 static void notify_tip(const WCHAR *title, const WCHAR *body, DWORD flags)
@@ -780,13 +799,29 @@ static void set_level(int i, int level, int charging)
 {
     SLOT *s = &g_slot[i];
     BOOL wasOn = slot_on_tray(i);
+    int limit = g_lowLevel;
 
-    if (level >= 0 && level <= 20 && !s->lowNotified && s->linked) {
-        notify_low(i);
-        s->lowNotified = TRUE;
+    /* 0% 单帧不可信：多个协议会把空帧 / 无应答解成 0（v1.1.3 已修 GameSir，
+       这里做通用兜底）。连续两帧 0% 才允许提醒，托盘照常显示读数。 */
+    if (level == 0) {
+        if (s->zeroStreak < 2)
+            s->zeroStreak++;
+    } else {
+        s->zeroStreak = 0;
     }
-    if (level > 25)
+
+    /* 充电中不催充电；缓存读数（linked = FALSE）也不提醒。
+       气泡提交失败就不置位，下一次读数还能重试，避免「错过就没第二次」。 */
+    if (g_lowEnabled && level >= 0 && level <= limit && charging != 1 &&
+        !s->lowNotified && s->linked && (level != 0 || s->zeroStreak >= 2)) {
+        if (notify_low(i, level))
+            s->lowNotified = TRUE;
+    }
+    /* 滞回：回到阈值 +5% 以上才重新具备提醒资格 */
+    if (level > limit + LOW_HYST) {
         s->lowNotified = FALSE;
+        s->zeroStreak = 0;
+    }
 
     if (level != s->level || charging != s->charging) {
         s->level = level;
@@ -866,6 +901,25 @@ static void show_menu(int i)
             AppendMenuW(iv, MF_STRING | (g_pollMs == kIntervals[k].ms ? MF_CHECKED : 0),
                         MENU_IV_BASE + k, kIntervals[k].label);
         AppendMenuW(m, MF_POPUP, (UINT_PTR)iv, L"刷新间隔");
+    }
+
+    /* 低电量提醒：开关、阈值、以及一条用来验证系统通知是否正常的气泡 */
+    {
+        HMENU lo = CreatePopupMenu();
+        AppendMenuW(lo, MF_STRING | (g_lowEnabled ? MF_CHECKED : 0),
+                    MENU_LOW_ONOFF, L"低电量时提醒");
+        AppendMenuW(lo, MF_SEPARATOR, 0, NULL);
+        WCHAR lbl[32];
+        for (int k = 0; k < LOW_COUNT; k++) {
+            wsprintfW(lbl, L"%d%% 及以下", kLowLevels[k]);
+            AppendMenuW(lo, MF_STRING |
+                        (g_lowEnabled ? 0 : MF_GRAYED) |
+                        ((g_lowEnabled && g_lowLevel == kLowLevels[k]) ? MF_CHECKED : 0),
+                        MENU_LOW_BASE + k, lbl);
+        }
+        AppendMenuW(lo, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(lo, MF_STRING, MENU_LOW_TEST, L"测试提醒气泡…");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)lo, L"低电量提醒");
     }
 
     /* 使用统计：累计连接时长 + 历史连接过的设备 */
@@ -1235,7 +1289,8 @@ static void slot_mark_dead(int i)
 
 static void apply_reading(int i, const READING *r)
 {
-    if (i < 0 || i >= g_n || !r->valid || r->level < 0)
+    /* 越界读数一律丢弃：个别协议解析失败时会留下 0..100 之外的垃圾值 */
+    if (i < 0 || i >= g_n || !r->valid || r->level < 0 || r->level > 100)
         return;
 
     SLOT *s = &g_slot[i];
@@ -1252,6 +1307,7 @@ static void apply_reading(int i, const READING *r)
         s->charging = -1;
         s->cachedMin = 0;
         s->lowNotified = FALSE;
+        s->zeroStreak = 0;
     }
 
     /* 从「离线」变成「在线」才开始计时；一段连接只开一次表 */
@@ -1626,7 +1682,26 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_nextPoll = GetTickCount64();      /* 换完立刻按新间隔读一次 */
             return 0;
         }
+        if (id >= MENU_LOW_BASE && id < MENU_LOW_BASE + LOW_COUNT) {
+            g_lowLevel = kLowLevels[id - MENU_LOW_BASE];
+            reg_set(L"LT", (DWORD)g_lowLevel);
+            /* 换阈值后立刻按新阈值判定一次，不用等电量越过滞回区 */
+            for (int k = 0; k < PROV_MAX; k++)
+                g_slot[k].lowNotified = FALSE;
+            return 0;
+        }
         switch (id) {
+        case MENU_LOW_ONOFF:
+            g_lowEnabled = g_lowEnabled ? FALSE : TRUE;
+            reg_set(L"LO", (DWORD)(g_lowEnabled ? 1 : 0));
+            for (int k = 0; k < PROV_MAX; k++)
+                g_slot[k].lowNotified = FALSE;
+            break;
+        case MENU_LOW_TEST:
+            notify_tip(L"BattTray 提醒测试",
+                       L"能看到这条气泡，说明托盘通知正常；看不到请检查 Windows 通知设置与「隐藏的图标」区。",
+                       NIIF_INFO);
+            break;
         case MENU_AUTORUN:
             autostart_apply(autostart_enabled() ? FALSE : TRUE);
             break;
@@ -1880,6 +1955,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         g_pollMs = ok ? ms : 300000;
     }
     prov_set_poll_ms(g_pollMs);
+
+    /* 低电量提醒设置：开关默认开，非法阈值回落到 20% */
+    g_lowEnabled = reg_get(L"LO", 1) ? TRUE : FALSE;
+    {
+        int lt = (int)reg_get(L"LT", 20);
+        int ok = 0;
+        for (int k = 0; k < LOW_COUNT; k++) {
+            if (kLowLevels[k] == lt) {
+                ok = 1;
+                break;
+            }
+        }
+        g_lowLevel = ok ? lt : 20;
+    }
 
     /* 启动后台工作线程：扫描 + 主动查询都在里面做，UI 线程不碰阻塞 IO */
     /* 手动重置：worker 每次被唤醒后自己 ResetEvent，确保「同一时刻的多次
