@@ -114,9 +114,7 @@ static int   g_logLen;
 /* XInput 动态加载 */
 typedef struct { BYTE type; BYTE level; } XIBAT;
 typedef DWORD (WINAPI *XI_GETBAT)(DWORD, BYTE, XIBAT *);
-typedef DWORD (WINAPI *XI_GETSTATE)(DWORD, void *);
 static XI_GETBAT   g_xiBat;
-static XI_GETSTATE g_xiState;
 static BOOL        g_xiTried;
 
 static void logf(const WCHAR *fmt, ...)
@@ -515,8 +513,11 @@ static BOOL io_read(HANDLE h, void *buf, DWORD len, DWORD *got, DWORD ms)
                 ok = TRUE;
             }
         } else {
+            /* 取消后必须等 IRP 真正完成才能释放栈上的 OVERLAPPED 与事件，
+               否则驱动迟到的完成会写已弹出的栈（use-after-free）。
+               CancelIo 对可取消的读是可靠的，放心等。 */
             CancelIo(h);
-            WaitForSingleObject(ev, 200);
+            WaitForSingleObject(ev, INFINITE);
         }
     }
     CloseHandle(ev);
@@ -540,8 +541,9 @@ static BOOL io_write(HANDLE h, const void *buf, DWORD len, DWORD ms)
         if (WaitForSingleObject(ev, ms) == WAIT_OBJECT_0)
             ok = GetOverlappedResult(h, &ov, &g, FALSE) ? TRUE : FALSE;
         else {
+            /* 同 io_read：取消后等完成，别让完成例程写已释放的栈 */
             CancelIo(h);
-            WaitForSingleObject(ev, 200);
+            WaitForSingleObject(ev, INFINITE);
         }
     }
     CloseHandle(ev);
@@ -1144,8 +1146,6 @@ static BOOL xi_init(void)
         if (!m)
             continue;
         g_xiBat = (XI_GETBAT)GetProcAddress(m, "XInputGetBatteryInformation");
-        if (!g_xiState)
-            g_xiState = (XI_GETSTATE)GetProcAddress(m, "XInputGetState");
         if (!g_xiBat) {
             /* 该版本没有电量接口，保持模块已加载无妨，继续下一个 */
         }
@@ -1176,31 +1176,6 @@ static BOOL xi_read(DWORD idx, READING *r)
     }
     r->charging = 0;
     r->valid = TRUE;
-    return TRUE;
-}
-
-/* 手柄确实连着、但电量读不出来。
-   大量第三方 2.4G dongle 会直接用 XINPUT_BATTERY_INFORMATION 谎报
-   type=WIRED / level=FULL（天剑PLUS 实测如此），所以只能靠有无手柄在线来区分，
-   不能把 type==WIRED 当作「没插手柄」。 */
-static BOOL xi_connected(DWORD idx, BOOL *wired)
-{
-    if (wired)
-        *wired = FALSE;
-    if (!g_xiState)
-        return FALSE;
-
-    BYTE state[32];               /* XINPUT_STATE 只有 16 字节，留足余量 */
-    ZeroMemory(state, sizeof(state));
-    if (g_xiState(idx, state) != ERROR_SUCCESS)
-        return FALSE;
-
-    if (wired && g_xiBat) {
-        XIBAT b;
-        ZeroMemory(&b, sizeof(b));
-        if (g_xiBat(idx, 0, &b) == ERROR_SUCCESS && b.type == 1)
-            *wired = TRUE;
-    }
     return TRUE;
 }
 
@@ -1533,7 +1508,9 @@ static BOOL match_group(COLL *col, int *idx, int gn, BYTE mask, DEVENT *d)
     }
 
     /* 8.2) 小鸡 GameSir：0x3537 厂商接口。手柄在 Xbox 模式下才推 0x12 报文，
-       没连手柄的 dongle 也会枚举但不说话——两种情况都登记，菜单里能看出区别。 */
+       没连手柄的 dongle 也会枚举但不说话。无应答时同样「认领」这个组：
+       一来占住它、不被后面的 Compx 分支误试，二来留个候选；
+       读不到电量的设备最终由 prov_scan 统一过滤，不会出现在列表里。 */
     {
         int cand = -1;
         for (int k = 0; k < gn; k++) {
@@ -1589,8 +1566,9 @@ static BOOL match_group(COLL *col, int *idx, int gn, BYTE mask, DEVENT *d)
 
     /* 8.5) 0xFF90 厂商通道：耳机 dongle。
        必须要求整组里出现音频类集合（TM_AUDIO），否则会和鼠标的其它
-       厂商页面混淆。这里不做「必须先应答」的门槛——耳机可能正处于
-       关机/休眠，先把它列出来、显示未知电量，比凭空消失更好。 */
+       厂商页面混淆。这里不做「必须先应答」的门槛——无应答的 dongle
+       也先认领（占住组、避免被 Compx 分支误试），lastLevel 记 -1，
+       最终同样由 prov_scan 过滤：读不到电量的设备不进列表。 */
     if (mask & TM_AUDIO) {
         for (int k = 0; k < gn; k++) {
             const COLL *c = &col[idx[k]];
@@ -1687,7 +1665,12 @@ static BOOL match_group(COLL *col, int *idx, int gn, BYTE mask, DEVENT *d)
 static void dev_free(DEVENT *d)
 {
     if (d->h) {
-        CancelIo(d->h);
+        /* CancelIo 只取消「调用线程」发出的 IRP；prov_arm 挂起的被动读是
+           UI 线程发的，必须 CancelIoEx 才能一并取消。取消后还要等 IRP
+           真正完成才能关句柄、清结构——否则迟到的完成会写已复用的内存。 */
+        CancelIoEx(d->h, NULL);
+        if (d->pending && d->ev)
+            WaitForSingleObject(d->ev, INFINITE);
         CloseHandle(d->h);
     }
     if (d->bat)
@@ -1979,7 +1962,11 @@ HANDLE prov_event(int i)
 static void dev_drop_handle(DEVENT *d)
 {
     if (d->h) {
+        /* 只会由 UI 线程走到这里（prov_arm / prov_read_ready），CancelIo 够用；
+           同样要等挂起的 IRP 完成后再关句柄，避免写已复用的 ov/buf。 */
         CancelIo(d->h);
+        if (d->pending && d->ev)
+            WaitForSingleObject(d->ev, INFINITE);
         CloseHandle(d->h);
         d->h = NULL;
     }
@@ -1997,15 +1984,16 @@ void prov_arm(int i)
     ZeroMemory(&d->ov, sizeof(d->ov));
     d->ov.hEvent = d->ev;
     ResetEvent(d->ev);
-    d->pending = TRUE;
 
     DWORD len = (d->inLen > 0 && d->inLen <= (DWORD)sizeof(d->buf)) ? (DWORD)d->inLen : 64;
     if (!ReadFile(d->h, d->buf, len, NULL, &d->ov)) {
         if (GetLastError() != ERROR_IO_PENDING) {
             logf(L"arm failed kind=%d err=%lu", d->kind, GetLastError());
             dev_drop_handle(d);
+            return;                /* 没有真的挂起读，不能置 pending */
         }
     }
+    d->pending = TRUE;             /* 立即完成或挂起，都算一次待消费的读 */
 }
 
 static void keep_raw(DEVENT *d, DWORD got)

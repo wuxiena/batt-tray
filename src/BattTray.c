@@ -12,6 +12,7 @@
 #define _UNICODE
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <dbt.h>
 #include <math.h>
 
@@ -23,8 +24,6 @@
 #define WM_POLL_DONE     (WM_APP + 4)   /* 工作线程：主动查询完成 */
 
 #define MENU_DEV_BASE    100
-#define MENU_PROTO       20
-#define MENU_RAW         21
 #define MENU_AUTORUN     3
 #define MENU_RESCAN      4
 #define MENU_EXIT        5
@@ -113,7 +112,7 @@ typedef struct {
 
 /* 历史连接记录：一台设备一条，按「品牌 + 类别」认人 */
 typedef struct {
-    WCHAR name[64];
+    WCHAR name[96];                 /* 与 dev_key 的键同宽：品牌最长 71 + 类别 15 */
     DWORD sec;          /* 累计连接秒数 */
     DWORD stamp;        /* 最后一次确认在线的分钟刻度 */
     BOOL  used;
@@ -779,10 +778,12 @@ static BOOL notify_low(int i, int level)
 
 static void notify_tip(const WCHAR *title, const WCHAR *body, DWORD flags)
 {
-    /* 没有可显示设备时，气泡挂到「入口图标」上，否则提示会直接丢失 */
+    /* 气泡必须挂在「当前已注册」的托盘图标上：刚扫出来、还没读到电量的设备
+       不占托盘图标，挂在它身上 NIM_MODIFY 会直接失败，提示就静默丢了。
+       一个占图标的都没有时（入口图标在）才用 TRAY_UID_ORPHAN。 */
     int i = -1;
     for (int k = 0; k < g_n; k++)
-        if (slot_alive(k)) { i = k; break; }
+        if (g_trayOn[k]) { i = k; break; }
     NOTIFYICONDATAW nid;
     ZeroMemory(&nid, sizeof(nid));
     nid.cbSize = sizeof(nid);
@@ -810,6 +811,19 @@ static void set_level(int i, int level, int charging)
         s->zeroStreak = 0;
     }
 
+    /* 先把新读数落到槽位、补齐托盘图标，再判提醒：气泡要挂在已注册的图标上，
+       首次实时读数（旧值 -1）或断连复活时，图标正是靠这次更新才出现的。
+       旧顺序先弹气泡再更新，那两种场景下 NIM_MODIFY 会因 uID 未注册而
+       失败一次，通知被推迟到下一个轮询周期。 */
+    if (level != s->level || charging != s->charging) {
+        s->level = level;
+        s->charging = charging;
+        slot_update(i);
+    }
+    /* 从「读不到」变成「读到了」（或反过来）：补上 / 撤掉托盘图标 */
+    if (wasOn != slot_on_tray(i))
+        tray_sync();
+
     /* 充电中不催充电；缓存读数（linked = FALSE）也不提醒。
        气泡提交失败就不置位，下一次读数还能重试，避免「错过就没第二次」。 */
     if (g_lowEnabled && level >= 0 && level <= limit && charging != 1 &&
@@ -822,15 +836,6 @@ static void set_level(int i, int level, int charging)
         s->lowNotified = FALSE;
         s->zeroStreak = 0;
     }
-
-    if (level != s->level || charging != s->charging) {
-        s->level = level;
-        s->charging = charging;
-        slot_update(i);
-    }
-    /* 从「读不到」变成「读到了」（或反过来）：补上 / 撤掉托盘图标 */
-    if (wasOn != slot_on_tray(i))
-        tray_sync();
 }
 
 /* ---------------- 菜单 ---------------- */
@@ -839,24 +844,52 @@ static void append_usage(const WCHAR *path);   /* 定义在使用时长那一段
 
 static void export_diag(void)
 {
-    WCHAR path[MAX_PATH];
+    /* 依次尝试：exe 所在目录 → 桌面 → %TEMP%。
+       exe 装在 Program Files 这类只读目录时，第一处会失败，别让
+       「导出诊断信息」变成永远不可用。 */
+    WCHAR path[MAX_PATH + 32];
+    const WCHAR *fname = L"BattTray-diag.txt";
+
     DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
     WCHAR *slash = NULL;
     for (DWORD i = 0; i < n; i++)
         if (path[i] == L'\\')
             slash = path + i;
-    if (slash)
+    if (slash) {
         slash[1] = 0;
-    else
-        path[0] = 0;
-    lstrcatW(path, L"BattTray-diag.txt");
-
-    if (prov_diag(path)) {
-        append_usage(path);
-        notify_tip(L"诊断信息已导出", path, NIIF_INFO);
-    } else {
-        notify_tip(L"导出失败", L"程序所在目录可能不可写。", NIIF_WARNING);
+        lstrcatW(path, fname);
+        if (prov_diag(path)) {
+            append_usage(path);
+            notify_tip(L"诊断信息已导出", path, NIIF_INFO);
+            return;
+        }
     }
+
+    WCHAR desk[MAX_PATH];
+    if (SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, desk) == S_OK) {
+        lstrcpynW(path, desk, MAX_PATH);
+        lstrcatW(path, L"\\");
+        lstrcatW(path, fname);
+        if (prov_diag(path)) {
+            append_usage(path);
+            notify_tip(L"诊断信息已导出（桌面）", path, NIIF_INFO);
+            return;
+        }
+    }
+
+    WCHAR tmp[MAX_PATH];
+    DWORD tn = GetTempPathW(MAX_PATH, tmp);
+    if (tn > 0 && tn < MAX_PATH) {
+        lstrcpynW(path, tmp, MAX_PATH);   /* GetTempPathW 自带结尾反斜杠 */
+        lstrcatW(path, fname);
+        if (prov_diag(path)) {
+            append_usage(path);
+            notify_tip(L"诊断信息已导出（临时目录）", path, NIIF_INFO);
+            return;
+        }
+    }
+
+    notify_tip(L"导出失败", L"程序目录、桌面和临时目录都不可写。", NIIF_WARNING);
 }
 
 static void fill_stats_menu(HMENU s);   /* 定义在使用时长那一段 */
@@ -965,7 +998,7 @@ static DWORD uw_atoi(const WCHAR *s)
 static void hist_parse(const WCHAR *s, HIST *h)
 {
     int n = 0;
-    while (s[n] && s[n] != L'|' && n < 63) {
+    while (s[n] && s[n] != L'|' && n < 95) {
         h->name[n] = s[n];
         n++;
     }
@@ -985,9 +1018,9 @@ static void hist_load(void)
 {
     ZeroMemory(g_hist, sizeof(g_hist));
     for (int i = 0; i < HIST_MAX; i++) {
-        WCHAR key[8], buf[160];
+        WCHAR key[8], buf[256];
         wsprintfW(key, L"H%d", i);
-        reg_get_str(key, buf, 160);
+        reg_get_str(key, buf, 256);
         if (buf[0])
             hist_parse(buf, &g_hist[i]);
     }
@@ -1002,7 +1035,7 @@ static void hist_save(void)
             reg_set_str(key, L"");
             continue;
         }
-        WCHAR buf[160];
+        WCHAR buf[256];
         wsprintfW(buf, L"%s|%u|%u", g_hist[i].name, g_hist[i].sec, g_hist[i].stamp);
         reg_set_str(key, buf);
     }
@@ -1037,7 +1070,7 @@ static int hist_slot(const WCHAR *name)
         idx = oldest;
     }
     ZeroMemory(&g_hist[idx], sizeof(HIST));
-    lstrcpynW(g_hist[idx].name, name, 64);
+    lstrcpynW(g_hist[idx].name, name, 96);
     g_hist[idx].used = TRUE;
     g_hist[idx].stamp = stamp_now();
     return idx;
@@ -1052,14 +1085,31 @@ static void hist_touch(const WCHAR *name, DWORD addSec)
 }
 
 /* 设备身份：品牌 + 类别。同一品牌同类型的两台设备会被并成一条，
-   这种情况很少见，换来的是槽位顺序变化时统计不会错乱。 */
+   这种情况很少见，换来的是槽位顺序变化时统计不会错乱。
+   品牌最长 71 字符（蓝牙设备直接拿设备名当品牌）+ 类别 15：必须按 cap
+   截断——旧实现用 wsprintfW 无界写入，设备名一长就砸穿调用方的栈。 */
 static void dev_key(int i, WCHAR *out, int cap)
 {
     DEVDESC d;
-    if (dev_info(i, &d))
-        wsprintfW(out, L"%s %s", d.brand, d.type);
-    else
+    if (cap <= 0)
+        return;
+    if (dev_info(i, &d)) {
+        int n = lstrlenW(d.brand);
+        if (n > cap - 1)
+            n = cap - 1;
+        CopyMemory(out, d.brand, (SIZE_T)n * sizeof(WCHAR));
+        out[n] = 0;
+        if (n + 2 <= cap) {              /* 还放得下 ' ' + 至少 1 个字符 */
+            out[n] = L' ';
+            int m = lstrlenW(d.type);
+            if (m > cap - n - 2)
+                m = cap - n - 2;
+            CopyMemory(out + n + 1, d.type, (SIZE_T)m * sizeof(WCHAR));
+            out[n + 1 + m] = 0;
+        }
+    } else {
         lstrcpynW(out, L"未知设备", cap);
+    }
 }
 
 static void fmt_dur(DWORD sec, WCHAR *out)
@@ -1096,8 +1146,8 @@ static DWORD slot_total_sec(int i)
     if (i < 0 || i >= g_n)
         return 0;
 
-    WCHAR key[64];
-    dev_key(i, key, 64);
+    WCHAR key[96];
+    dev_key(i, key, 96);
     int idx = hist_find(key);
     DWORD total = (idx >= 0) ? g_hist[idx].sec : 0;
 
@@ -1119,8 +1169,8 @@ static void slot_settle(int i)
     g_slot[i].connSince = 0;
 
     if (add > 0) {
-        WCHAR key[64];
-        dev_key(i, key, 64);
+        WCHAR key[96];
+        dev_key(i, key, 96);
         hist_touch(key, add);
     }
 }
@@ -1138,8 +1188,8 @@ static void fill_stats_menu(HMENU s)
         if (!slot_alive(i) || !g_slot[i].connSince)
             continue;
 
-        WCHAR key[64];
-        dev_key(i, key, 64);
+        WCHAR key[96];
+        dev_key(i, key, 96);
         fmt_dur(slot_total_sec(i), dur);
         wsprintfW(t, L"%s · 累计 %s（使用中）", key, dur);
         AppendMenuW(s, MF_STRING | MF_GRAYED, MENU_HIST_BASE + i, t);
@@ -1200,8 +1250,8 @@ static void append_usage(const WCHAR *path)
     for (int i = 0; i < g_n; i++) {
         if (!slot_alive(i))
             continue;
-        WCHAR key[64];
-        dev_key(i, key, 64);
+        WCHAR key[96];
+        dev_key(i, key, 96);
         if (g_slot[i].connSince) {
             fmt_dur(slot_total_sec(i), dur);
             wsprintfW(line, L"  [在线] %s · 累计 %s\r\n", key, dur);
@@ -1312,8 +1362,8 @@ static void apply_reading(int i, const READING *r)
 
     /* 从「离线」变成「在线」才开始计时；一段连接只开一次表 */
     if (!s->connSince) {
-        WCHAR k2[64];
-        dev_key(i, k2, 64);
+        WCHAR k2[96];
+        dev_key(i, k2, 96);
         int h = hist_slot(k2);
         g_hist[h].stamp = stamp_now();
         hist_save();
@@ -1630,8 +1680,8 @@ static void tick(void)
             DWORD add = (DWORD)((now - g_slot[i].connSince) / 1000);
             if (add > 0) {
                 g_slot[i].connSince = now;
-                WCHAR key[64];
-                dev_key(i, key, 64);
+                WCHAR key[96];
+                dev_key(i, key, 96);
                 hist_touch(key, add);
             }
         }
@@ -1685,9 +1735,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (id >= MENU_LOW_BASE && id < MENU_LOW_BASE + LOW_COUNT) {
             g_lowLevel = kLowLevels[id - MENU_LOW_BASE];
             reg_set(L"LT", (DWORD)g_lowLevel);
-            /* 换阈值后立刻按新阈值判定一次，不用等电量越过滞回区 */
+            /* 换阈值后立刻按新阈值判定：不用等电量越过滞回区，
+               也不用等下一个轮询周期（主动型立刻重查一轮）。 */
             for (int k = 0; k < PROV_MAX; k++)
                 g_slot[k].lowNotified = FALSE;
+            g_nextPoll = GetTickCount64();
             return 0;
         }
         switch (id) {
@@ -1696,6 +1748,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             reg_set(L"LO", (DWORD)(g_lowEnabled ? 1 : 0));
             for (int k = 0; k < PROV_MAX; k++)
                 g_slot[k].lowNotified = FALSE;
+            if (g_lowEnabled)
+                g_nextPoll = GetTickCount64();  /* 打开后立刻按当前电量判定 */
             break;
         case MENU_LOW_TEST:
             notify_tip(L"BattTray 提醒测试",
@@ -1750,6 +1804,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_POLL_DONE:
+        /* 扫描在途时 g_dev 正被工作线程重建，这批结果是按旧设备序号记的，
+           直接消费会把读数安到错设备上（甚至读到撕裂的字符串）。丢弃——
+           scan_done 完成后本来就会立刻重新查询一轮。 */
+        if (g_scanBusy) {
+            for (int k = 0; k < PROV_MAX; k++)
+                InterlockedExchange(&g_resNew[k], 0);
+            return 0;
+        }
         poll_done();
         return 0;
 
@@ -1828,17 +1890,21 @@ static void save_cache_names(void)
         slot_reg_name(i, L"N", key);
 
         /* 槽位换过设备时，旧读数必须一起作废。
-           否则下一个进程启动时名字已经对上，会把别人的电量当成自己的缓存显示。 */
+           缓存名存「品牌 + 类别」：同一品牌的不同设备（罗技鼠标 + 罗技耳机）
+           枚举顺序对调时，才不会把别人的电量当成自己的缓存显示。
+           旧版本只存品牌、认不出类别，升级后第一次一律作废（只丢一次缓存）。 */
+        WCHAR want[96];
+        wsprintfW(want, L"%s %s", d.brand, d.type);
         WCHAR old[96];
         reg_get_str(key, old, 96);
-        if (old[0] && lstrcmpW(old, d.brand) != 0) {
+        if (old[0] && lstrcmpW(old, want) != 0) {
             WCHAR k2[16];
             slot_reg_name(i, L"L", k2);
             reg_set(k2, 0xFFFFFFFFu);       /* load_cache 见到它就跳过 */
             slot_reg_name(i, L"S", k2);
             reg_set(k2, 0);
         }
-        reg_set_str(key, d.brand);
+        reg_set_str(key, want);
     }
 }
 
