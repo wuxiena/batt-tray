@@ -26,7 +26,7 @@ if not exist "dist" mkdir "dist"
 
 "%ZIG%" cc -target x86_64-windows-gnu -O2 -s -Wl,--subsystem,windows ^
     -o dist\BattTray.exe src\BattTray.c src\providers.c ^
-    -luser32 -lshell32 -lgdi32 -ladvapi32 -lhid -lsetupapi -lm
+    -luser32 -lshell32 -lgdi32 -ladvapi32 -lhid -lsetupapi -lshcore -lm
 if errorlevel 1 (
     echo BUILD FAILED
     exit /b 1

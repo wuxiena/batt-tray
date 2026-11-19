@@ -15,6 +15,8 @@
 #include <shlobj.h>
 #include <dbt.h>
 #include <math.h>
+#include <strsafe.h>
+#include <shellscalingapi.h>
 
 #include "providers.h"
 
@@ -495,24 +497,24 @@ static void slot_tip(int i, WCHAR *out, int cap)
 
     if (s->level < 0) {
         if (text_has(d.detail, L"无应答"))
-            wsprintfW(out, L"%s %s · dongle 不提供电量", d.brand, d.type);
+            StringCchPrintfW(out, (size_t)cap, L"%s %s · dongle 不提供电量", d.brand, d.type);
         else
-            wsprintfW(out, L"%s %s · 等待数据…", d.brand, d.type);
+            StringCchPrintfW(out, (size_t)cap, L"%s %s · 等待数据…", d.brand, d.type);
         return;
     }
     if (s->linked) {
-        wsprintfW(out, L"%s %s · %d%%%s", d.brand, d.type, s->level,
-                  s->charging == 1 ? L" 充电中" : L"");
+        StringCchPrintfW(out, (size_t)cap, L"%s %s · %d%%%s", d.brand, d.type, s->level,
+                         s->charging == 1 ? L" 充电中" : L"");
         return;
     }
     if (s->cachedMin >= 120)
-        wsprintfW(out, L"%s %s · %d%%（%d 小时前读数）", d.brand, d.type, s->level,
-                  s->cachedMin / 60);
+        StringCchPrintfW(out, (size_t)cap, L"%s %s · %d%%（%d 小时前读数）", d.brand, d.type,
+                         s->level, s->cachedMin / 60);
     else if (s->cachedMin > 0)
-        wsprintfW(out, L"%s %s · %d%%（%d 分钟前读数）", d.brand, d.type, s->level,
-                  s->cachedMin);
+        StringCchPrintfW(out, (size_t)cap, L"%s %s · %d%%（%d 分钟前读数）", d.brand, d.type,
+                         s->level, s->cachedMin);
     else
-        wsprintfW(out, L"%s %s · %d%%（缓存）", d.brand, d.type, s->level);
+        StringCchPrintfW(out, (size_t)cap, L"%s %s · %d%%（缓存）", d.brand, d.type, s->level);
 }
 
 static void tray_show(int i, BOOL add)
@@ -552,7 +554,7 @@ static void orphan_tip(WCHAR *out, int cap)
             continue;
         DEVDESC d;
         if (dev_info(i, &d)) {
-            wsprintfW(out, L"%s %s · 已断开", d.brand, d.type);
+            StringCchPrintfW(out, (size_t)cap, L"%s %s · 已断开", d.brand, d.type);
             return;
         }
     }
@@ -771,8 +773,9 @@ static BOOL notify_low(int i, int level)
     nid.uID = (UINT)(TRAY_UID_BASE + i);
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_WARNING;
-    wsprintfW(nid.szInfoTitle, L"%s %s 电量低", d.brand, d.type);
-    wsprintfW(nid.szInfo, L"剩余 %d%%，建议充电。", level);
+    /* szInfoTitle 固定 64 字符，蓝牙设备名可能很长，必须限长写入，否则写穿 nid */
+    StringCchPrintfW(nid.szInfoTitle, ARRAYSIZE(nid.szInfoTitle), L"%s 电量低", d.brand);
+    StringCchPrintfW(nid.szInfo, ARRAYSIZE(nid.szInfo), L"剩余 %d%%，建议充电。", level);
     return Shell_NotifyIconW(NIM_MODIFY, &nid) ? TRUE : FALSE;
 }
 
@@ -915,10 +918,10 @@ static void show_menu(int i)
             if (s->level < 0)
                 continue;               /* 读不到电量的不列（协议层已过滤，兜底） */
             if (s->charging == 1)
-                wsprintfW(t, L"%s %s · %d%%（充电中）", d.brand, d.type, s->level);
+                StringCchPrintfW(t, 200, L"%s %s · %d%%（充电中）", d.brand, d.type, s->level);
             else
-                wsprintfW(t, L"%s %s · %d%%%s", d.brand, d.type, s->level,
-                          s->linked ? L"" : L"（缓存）");
+                StringCchPrintfW(t, 200, L"%s %s · %d%%%s", d.brand, d.type, s->level,
+                                 s->linked ? L"" : L"（缓存）");
             AppendMenuW(m, MF_STRING | MF_GRAYED, MENU_DEV_BASE + k, t);
         }
     }
@@ -1028,16 +1031,21 @@ static void hist_load(void)
 
 static void hist_save(void)
 {
+    /* 写前比较：内容没变就不写。hist_touch 每次电量读数都会走到这里，
+       全量重写 12 个 REG_SZ 的注册表开销在低功耗场景下不值得。 */
     for (int i = 0; i < HIST_MAX; i++) {
         WCHAR key[8];
         wsprintfW(key, L"H%d", i);
-        if (!g_hist[i].used) {
-            reg_set_str(key, L"");
-            continue;
-        }
-        WCHAR buf[256];
-        wsprintfW(buf, L"%s|%u|%u", g_hist[i].name, g_hist[i].sec, g_hist[i].stamp);
-        reg_set_str(key, buf);
+
+        WCHAR buf[256] = L"";
+        if (g_hist[i].used)
+            StringCchPrintfW(buf, 256, L"%s|%u|%u",
+                             g_hist[i].name, g_hist[i].sec, g_hist[i].stamp);
+
+        WCHAR old[256];
+        reg_get_str(key, old, 256);
+        if (lstrcmpW(old, buf) != 0)
+            reg_set_str(key, buf);
     }
 }
 
@@ -1191,7 +1199,7 @@ static void fill_stats_menu(HMENU s)
         WCHAR key[96];
         dev_key(i, key, 96);
         fmt_dur(slot_total_sec(i), dur);
-        wsprintfW(t, L"%s · 累计 %s（使用中）", key, dur);
+        StringCchPrintfW(t, 220, L"%s · 累计 %s（使用中）", key, dur);
         AppendMenuW(s, MF_STRING | MF_GRAYED, MENU_HIST_BASE + i, t);
 
         int h = hist_find(key);
@@ -1208,7 +1216,7 @@ static void fill_stats_menu(HMENU s)
             AppendMenuW(s, MF_SEPARATOR, 0, NULL);
         fmt_dur(g_hist[h].sec, dur);
         fmt_ago(g_hist[h].stamp, ago);
-        wsprintfW(t, L"%s · 累计 %s · %s", g_hist[h].name, dur, ago);
+        StringCchPrintfW(t, 220, L"%s · 累计 %s · %s", g_hist[h].name, dur, ago);
         AppendMenuW(s, MF_STRING | MF_GRAYED, MENU_HIST_BASE + 30 + h, t);
         histShown++;
     }
@@ -1254,9 +1262,9 @@ static void append_usage(const WCHAR *path)
         dev_key(i, key, 96);
         if (g_slot[i].connSince) {
             fmt_dur(slot_total_sec(i), dur);
-            wsprintfW(line, L"  [在线] %s · 累计 %s\r\n", key, dur);
+            StringCchPrintfW(line, 256, L"  [在线] %s · 累计 %s\r\n", key, dur);
         } else {
-            wsprintfW(line, L"  [在线] %s · 未计时（还没读到实时值）\r\n", key);
+            StringCchPrintfW(line, 256, L"  [在线] %s · 未计时（还没读到实时值）\r\n", key);
         }
         lstrcatW(txt, line);
         online++;
@@ -1270,7 +1278,8 @@ static void append_usage(const WCHAR *path)
             continue;
         fmt_dur(g_hist[h].sec, dur);
         fmt_ago(g_hist[h].stamp, ago);
-        wsprintfW(line, L"  [历史] %s · 累计 %s · 最后在线 %s\r\n", g_hist[h].name, dur, ago);
+        StringCchPrintfW(line, 256, L"  [历史] %s · 累计 %s · 最后在线 %s\r\n",
+                         g_hist[h].name, dur, ago);
         lstrcatW(txt, line);
         any = TRUE;
     }
@@ -1402,7 +1411,7 @@ static void rebuild_slots(int prevN, SLOT *prev, WCHAR prevKey[][96])
         DEVDESC d;
         WCHAR key[96] = L"";
         if (dev_info(i, &d))
-            wsprintfW(key, L"%s|%s", d.brand, d.type);
+            StringCchPrintfW(key, ARRAYSIZE(key), L"%s|%s", d.brand, d.type);
 
         BOOL reused = FALSE;
         for (int j = 0; j < prevN; j++) {
@@ -1500,7 +1509,7 @@ static void do_scan(void)
         DEVDESC d;
         g_prevKey[i][0] = 0;
         if (dev_info(i, &d))
-            wsprintfW(g_prevKey[i], L"%s|%s", d.brand, d.type);
+            StringCchPrintfW(g_prevKey[i], 96, L"%s|%s", d.brand, d.type);
     }
 
     request_scan();          /* 真正的枚举 + 探测在工作线程里做 */
@@ -1794,6 +1803,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_POWERBROADCAST:
+        /* 睡眠/休眠唤醒：无线接收器断电重连，HID 句柄要重新握手。
+           立即触发一轮查询并重扫，别让电量显示干等下一个轮询周期。 */
+        if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
+            g_nextPoll = GetTickCount64();
+            request_scan();
+        }
+        return 0;
+
     case WM_RESCAN:
         do_scan();
         return 0;
@@ -1867,7 +1885,7 @@ static void load_cache(void)
         /* 槽位顺序可能变过，名字不一致就当没有缓存 */
         if (name[0] && lstrcmpW(name, d.brand) != 0) {
             WCHAR name2[96];
-            wsprintfW(name2, L"%s %s", d.brand, d.type);
+            StringCchPrintfW(name2, 96, L"%s %s", d.brand, d.type);
             if (lstrcmpW(name2, name) != 0)
                 continue;
         }
@@ -1894,7 +1912,7 @@ static void save_cache_names(void)
            枚举顺序对调时，才不会把别人的电量当成自己的缓存显示。
            旧版本只存品牌、认不出类别，升级后第一次一律作废（只丢一次缓存）。 */
         WCHAR want[96];
-        wsprintfW(want, L"%s %s", d.brand, d.type);
+        StringCchPrintfW(want, 96, L"%s %s", d.brand, d.type);
         WCHAR old[96];
         reg_get_str(key, old, 96);
         if (old[0] && lstrcmpW(old, want) != 0) {
@@ -1985,7 +2003,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS)
         return 0;
 
-    SetProcessDPIAware();
+    /* 高 DPI：优先用 Per-Monitor 感知（Win8.1+），旧系统回退到进程级。
+       托盘图标在混合缩放的多屏上才不发虚。 */
+    if (FAILED(SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)))
+        SetProcessDPIAware();
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -2130,6 +2151,10 @@ done:
     for (int i = 0; i < PROV_MAX; i++) {
         if (g_slot[i].icon)
             DestroyIcon(g_slot[i].icon);
+    }
+    if (g_orphanIcon) {
+        DestroyIcon(g_orphanIcon);
+        g_orphanIcon = NULL;
     }
 
     /* 卸载流程：done 末尾的结算（slot_settle → hist_save）会重写历史键，
